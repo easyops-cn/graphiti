@@ -646,9 +646,9 @@ async def resolve_extracted_edge(
         resolved_edge.name = DEFAULT_EDGE_NAME
         resolved_edge.attributes = {}
     elif not is_default_type:
-        # Non-custom labels are allowed to pass through so long as the LLM does
-        # not return the sentinel DEFAULT value.
-        resolved_edge.name = fact_type
+        # EasyOps customization: Non-schema edge types also degrade to DEFAULT
+        # to enforce strict schema control over edge types.
+        resolved_edge.name = DEFAULT_EDGE_NAME
         resolved_edge.attributes = {}
 
     end = time()

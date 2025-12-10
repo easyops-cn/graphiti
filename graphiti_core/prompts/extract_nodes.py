@@ -24,6 +24,29 @@ from .models import Message, PromptFunction, PromptVersion
 from .prompt_helpers import to_prompt_json
 from .snippets import summary_instructions
 
+# Knowledge Graph Builder's Principles - fundamental guidelines for entity extraction
+KNOWLEDGE_GRAPH_PRINCIPLES = """
+## KNOWLEDGE GRAPH BUILDER'S PRINCIPLES (Must Follow)
+
+You are building an enterprise knowledge graph. Every entity you extract will become a permanent node that other documents can reference and build relationships upon.
+
+Before extracting any entity, verify it passes ALL four principles:
+
+1. **Permanence Principle**: Only extract entities that have lasting value beyond this single document.
+   Ask: "Will this entity still be meaningful and useful 6 months from now?"
+
+2. **Connectivity Principle**: Only extract entities that can form meaningful relationships with other entities.
+   Ask: "Can this entity connect to other concepts in a knowledge graph?"
+
+3. **Independence Principle**: Only extract entities that are self-explanatory without the source document.
+   Ask: "Would someone understand this entity name without reading the original text?"
+
+4. **Domain Value Principle**: Only extract entities that represent real domain knowledge, not document artifacts.
+   Ask: "Is this a concept a domain expert would recognize and care about?"
+
+**EXTRACTION DECISION**: If uncertain about any principle, do NOT extract. It is better to miss an entity than to pollute the knowledge graph with noise.
+"""
+
 
 class ExtractedEntity(BaseModel):
     name: str = Field(
@@ -54,6 +77,17 @@ class MissedEntities(BaseModel):
     missed_entities: list[str] = Field(..., description="Names of entities that weren't extracted")
 
 
+class EntitiesToFilter(BaseModel):
+    entities_to_remove: list[str] = Field(
+        ...,
+        description='Names of entities that should be removed from the knowledge graph',
+    )
+    reasoning: str = Field(
+        ...,
+        description='Brief explanation of why these entities were flagged for removal',
+    )
+
+
 class EntityClassificationTriple(BaseModel):
     uuid: str = Field(description='UUID of the entity')
     name: str = Field(description='Name of the entity')
@@ -81,6 +115,7 @@ class Prompt(Protocol):
     extract_json: PromptVersion
     extract_text: PromptVersion
     reflexion: PromptVersion
+    filter_entities: PromptVersion
     classify_nodes: PromptVersion
     extract_attributes: PromptVersion
     extract_summary: PromptVersion
@@ -91,14 +126,17 @@ class Versions(TypedDict):
     extract_json: PromptFunction
     extract_text: PromptFunction
     reflexion: PromptFunction
+    filter_entities: PromptFunction
     classify_nodes: PromptFunction
     extract_attributes: PromptFunction
     extract_summary: PromptFunction
 
 
 def extract_message(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are an AI assistant that extracts entity nodes from conversational messages. 
-    Your primary task is to extract and classify the speaker and other significant entities mentioned in the conversation."""
+    sys_prompt = f"""You are an AI assistant that extracts entity nodes from conversational messages for building an enterprise knowledge graph.
+    Your primary task is to extract and classify the speaker and other significant entities mentioned in the conversation.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}"""
 
     user_prompt = f"""
 <ENTITY TYPES>
@@ -153,8 +191,10 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
 
 
 def extract_json(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are an AI assistant that extracts entity nodes from JSON. 
-    Your primary task is to extract and classify relevant entities from JSON files"""
+    sys_prompt = f"""You are an AI assistant that extracts entity nodes from JSON for building an enterprise knowledge graph.
+    Your primary task is to extract and classify relevant entities from JSON files.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}"""
 
     user_prompt = f"""
 <ENTITY TYPES>
@@ -186,8 +226,10 @@ Guidelines:
 
 
 def extract_text(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are an AI assistant that extracts entity nodes from text. 
-    Your primary task is to extract and classify the speaker and other significant entities mentioned in the provided text."""
+    sys_prompt = f"""You are an AI assistant that extracts entity nodes from text for building an enterprise knowledge graph.
+    Your primary task is to extract and classify significant entities mentioned in the provided text.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}"""
 
     user_prompt = f"""
 <ENTITY TYPES>
@@ -238,6 +280,44 @@ def reflexion(context: dict[str, Any]) -> list[Message]:
 
 Given the above previous messages, current message, and list of extracted entities; determine if any entities haven't been
 extracted.
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
+def filter_entities(context: dict[str, Any]) -> list[Message]:
+    sys_prompt = """You are a knowledge graph quality reviewer. Your task is to identify entities that should NOT be in an enterprise knowledge graph.
+
+Review each extracted entity against the Knowledge Graph Builder's Principles:
+
+1. **Permanence Principle**: Does it have lasting value beyond this document?
+2. **Connectivity Principle**: Can it meaningfully connect to other entities?
+3. **Independence Principle**: Is the name self-explanatory without the source text?
+4. **Domain Value Principle**: Does it represent real domain knowledge, not document artifacts?
+
+An entity should be REMOVED if it fails ANY of these principles."""
+
+    user_prompt = f"""
+<EXTRACTED ENTITIES>
+{context['extracted_entities']}
+</EXTRACTED ENTITIES>
+
+<SOURCE TEXT>
+{context['episode_content']}
+</SOURCE TEXT>
+
+Review each extracted entity. Return the names of entities that FAIL any Knowledge Graph Builder's Principle.
+
+These entities should typically be removed:
+- Variables, function names, or IDs that only make sense within code examples
+- Placeholder values or template markers (e.g., $1, fwjfl7towi)
+- Generic process terms without specific domain meaning
+- Technical artifacts of document formatting
+- Concepts that require the source document to understand
+
+Return an empty list if all entities pass the quality check.
 """
     return [
         Message(role='system', content=sys_prompt),
@@ -338,6 +418,7 @@ versions: Versions = {
     'extract_json': extract_json,
     'extract_text': extract_text,
     'reflexion': reflexion,
+    'filter_entities': filter_entities,
     'extract_summary': extract_summary,
     'classify_nodes': classify_nodes,
     'extract_attributes': extract_attributes,

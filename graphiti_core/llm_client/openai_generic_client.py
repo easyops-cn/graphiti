@@ -107,6 +107,13 @@ class OpenAIGenericClient(LLMClient):
         official_hosts = ['api.openai.com', 'openai.azure.com']
         return any(host in base_url for host in official_hosts)
 
+    def _get_model_for_size(self, model_size: ModelSize) -> str:
+        """Get the appropriate model name based on the requested size."""
+        if model_size == ModelSize.small:
+            return self.small_model or self.model or DEFAULT_MODEL
+        else:
+            return self.model or DEFAULT_MODEL
+
     async def _generate_response(
         self,
         messages: list[Message],
@@ -269,7 +276,8 @@ class OpenAIGenericClient(LLMClient):
                         break
 
             # Log request before API call
-            logger.info(f'[LLM] >>> model={self.model}, response_model={response_model.__name__ if response_model else None}')
+            model = self._get_model_for_size(model_size)
+            logger.info(f'[LLM] >>> model={model}, response_model={response_model.__name__ if response_model else None}')
             # Log all messages (full content for debugging)
             for i, msg in enumerate(openai_messages):
                 msg_content = str(msg.get('content', ''))
@@ -277,7 +285,7 @@ class OpenAIGenericClient(LLMClient):
 
             start_time = time.time()
             response = await self.client.chat.completions.create(
-                model=self.model or DEFAULT_MODEL,
+                model=model,
                 messages=openai_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,

@@ -34,6 +34,7 @@ from graphiti_core.nodes import (
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_nodes import NodeDuplicate, NodeResolutions
 from graphiti_core.prompts.extract_nodes import (
+    EntitiesToFilter,
     EntitySummary,
     ExtractedEntities,
     ExtractedEntity,
@@ -83,6 +84,46 @@ async def extract_nodes_reflexion(
     missed_entities = llm_response.get('missed_entities', [])
 
     return missed_entities
+
+
+async def filter_extracted_nodes(
+    llm_client: LLMClient,
+    episode: EpisodicNode,
+    extracted_entities: list[ExtractedEntity],
+    group_id: str | None = None,
+) -> list[str]:
+    """Filter out entities that don't meet knowledge graph quality standards.
+
+    Uses the Knowledge Graph Builder's Principles to identify and remove:
+    - Entities without lasting value (Permanence)
+    - Entities that can't connect meaningfully (Connectivity)
+    - Entities that aren't self-explanatory (Independence)
+    - Document artifacts instead of domain knowledge (Domain Value)
+    """
+    if not extracted_entities:
+        return []
+
+    context = {
+        'episode_content': episode.content,
+        'extracted_entities': [e.name for e in extracted_entities],
+    }
+
+    llm_response = await llm_client.generate_response(
+        prompt_library.extract_nodes.filter_entities(context),
+        EntitiesToFilter,
+        group_id=group_id,
+        prompt_name='extract_nodes.filter_entities',
+    )
+
+    entities_to_remove = llm_response.get('entities_to_remove', [])
+    reasoning = llm_response.get('reasoning', '')
+
+    if entities_to_remove:
+        logger.info(
+            f'Filtering {len(entities_to_remove)} entities: {entities_to_remove}. Reason: {reasoning}'
+        )
+
+    return entities_to_remove
 
 
 async def extract_nodes(
@@ -179,6 +220,21 @@ async def extract_nodes(
             custom_prompt = 'Make sure that the following entities are extracted: '
             for entity in missing_entities:
                 custom_prompt += f'\n{entity},'
+
+    # Filter entities using Knowledge Graph Builder's Principles
+    llm_start = time()
+    entities_to_remove = await filter_extracted_nodes(
+        llm_client,
+        episode,
+        extracted_entities,
+        episode.group_id,
+    )
+    llm_call_count += 1
+    perf_logger.info(f'[PERF]     └─ extract_nodes filter #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
+
+    # Remove filtered entities
+    entities_to_remove_set = set(entities_to_remove)
+    extracted_entities = [e for e in extracted_entities if e.name not in entities_to_remove_set]
 
     filtered_extracted_entities = [entity for entity in extracted_entities if entity.name.strip()]
     end = time()
