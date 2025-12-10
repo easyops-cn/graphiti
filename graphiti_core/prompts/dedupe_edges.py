@@ -32,6 +32,11 @@ class EdgeDuplicate(BaseModel):
         description='List of idx values of facts that should be invalidated. If no facts should be invalidated, the list should be empty.',
     )
     fact_type: str = Field(..., description='One of the provided fact types or DEFAULT')
+    fact_type_reasoning: str = Field(
+        ...,
+        description='Brief reasoning (1-2 sentences) explaining why the chosen fact_type is correct '
+        'based on the FACT TYPES descriptions, or why DEFAULT was chosen if no type matched.',
+    )
 
 
 class UniqueFact(BaseModel):
@@ -135,7 +140,12 @@ def resolve_edge(context: dict[str, Any]) -> list[Message]:
 
         2. FACT TYPE CLASSIFICATION:
            - Given the predefined FACT TYPES, determine if the NEW FACT should be classified as one of these types.
+           - **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each fact type description to ensure correct classification.
            - Return the fact type as fact_type or DEFAULT if NEW FACT is not one of the FACT TYPES.
+           - **Reasoning Requirement**: Provide a brief `fact_type_reasoning` (1-2 sentences) explaining:
+             - Why the chosen fact_type matches the NEW FACT based on the FACT TYPES descriptions
+             - Or why DEFAULT was chosen if no type matched (what was missing or wrong)
+             - This forces careful consideration before classification.
 
         3. CONTRADICTION DETECTION:
            - Based on FACT INVALIDATION CANDIDATES and NEW FACT, determine which facts the new fact contradicts.

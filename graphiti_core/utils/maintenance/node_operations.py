@@ -93,11 +93,13 @@ async def extract_nodes(
     excluded_entity_types: list[str] | None = None,
 ) -> list[EntityNode]:
     start = time()
+    perf_logger = logging.getLogger('graphiti.performance')
     llm_client = clients.llm_client
     llm_response = {}
     custom_prompt = ''
     entities_missed = True
     reflexion_iterations = 0
+    llm_call_count = 0
 
     entity_types_context = [
         {
@@ -130,6 +132,7 @@ async def extract_nodes(
     }
 
     while entities_missed and reflexion_iterations <= MAX_REFLEXION_ITERATIONS:
+        llm_start = time()
         if episode.source == EpisodeType.message:
             llm_response = await llm_client.generate_response(
                 prompt_library.extract_nodes.extract_message(context),
@@ -151,6 +154,8 @@ async def extract_nodes(
                 group_id=episode.group_id,
                 prompt_name='extract_nodes.extract_json',
             )
+        llm_call_count += 1
+        perf_logger.info(f'[PERF]     └─ extract_nodes LLM call #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
         response_object = ExtractedEntities(**llm_response)
 
@@ -158,6 +163,7 @@ async def extract_nodes(
 
         reflexion_iterations += 1
         if reflexion_iterations < MAX_REFLEXION_ITERATIONS:
+            llm_start = time()
             missing_entities = await extract_nodes_reflexion(
                 llm_client,
                 episode,
@@ -165,6 +171,8 @@ async def extract_nodes(
                 [entity.name for entity in extracted_entities],
                 episode.group_id,
             )
+            llm_call_count += 1
+            perf_logger.info(f'[PERF]     └─ extract_nodes reflexion #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
             entities_missed = len(missing_entities) != 0
 
@@ -175,6 +183,7 @@ async def extract_nodes(
     filtered_extracted_entities = [entity for entity in extracted_entities if entity.name.strip()]
     end = time()
     logger.debug(f'Extracted new nodes: {filtered_extracted_entities} in {(end - start) * 1000} ms')
+    perf_logger.info(f'[PERF]   └─ extract_nodes TOTAL: {(end - start)*1000:.0f}ms, entities={len(filtered_extracted_entities)}, llm_calls={llm_call_count}')
     # Convert the extracted data into EntityNode objects
     extracted_nodes = []
     for extracted_entity in filtered_extracted_entities:
@@ -214,6 +223,18 @@ async def _collect_candidate_nodes(
     existing_nodes_override: list[EntityNode] | None,
 ) -> list[EntityNode]:
     """Search per extracted name and return unique candidates with overrides honored in order."""
+    perf_logger = logging.getLogger('graphiti.performance')
+
+    # Pre-batch embeddings for all node names to avoid per-search embedding calls
+    step_start = time()
+    node_names = [node.name.replace('\n', ' ') for node in extracted_nodes]
+    if node_names:
+        query_embeddings = await clients.embedder.create_batch(node_names)
+    else:
+        query_embeddings = []
+    perf_logger.info(f'[PERF]       └─ batch_search_embeddings: {(time() - step_start)*1000:.0f}ms, count={len(node_names)}')
+
+    step_start = time()
     search_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -222,10 +243,12 @@ async def _collect_candidate_nodes(
                 group_ids=[node.group_id],
                 search_filter=SearchFilters(),
                 config=NODE_HYBRID_SEARCH_RRF,
+                query_vector=query_embeddings[i] if i < len(query_embeddings) else None,
             )
-            for node in extracted_nodes
+            for i, node in enumerate(extracted_nodes)
         ]
     )
+    perf_logger.info(f'[PERF]       └─ parallel_node_search: {(time() - step_start)*1000:.0f}ms')
 
     candidate_nodes: list[EntityNode] = [node for result in search_results for node in result.nodes]
 
@@ -536,7 +559,12 @@ async def _extract_entity_attributes(
     )
 
     # validate response
-    entity_type(**llm_response)
+    try:
+        entity_type(**llm_response)
+    except Exception as e:
+        logger.error(f"Entity attribute validation failed for {entity_type.__name__}: {e}")
+        logger.error(f"LLM response was: {llm_response}")
+        raise
 
     return llm_response
 

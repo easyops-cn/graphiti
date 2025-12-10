@@ -34,6 +34,7 @@ from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import normalize_l2, semaphore_gather
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_save_bulk_query,
+    get_entity_edge_save_bulk_query_by_type,
     get_episodic_edge_save_bulk_query,
 )
 from graphiti_core.models.nodes.node_db_queries import (
@@ -64,6 +65,55 @@ from graphiti_core.utils.maintenance.node_operations import (
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 10
+
+
+def _sanitize_string_for_falkordb(value: str) -> str:
+    """Sanitize string content for FalkorDB query parameters.
+
+    FalkorDB's stringify_param_value only escapes backslashes and double quotes,
+    but control characters (newlines, carriage returns, tabs, etc.) can break
+    the Cypher query parsing. This function escapes these characters.
+    """
+    if not isinstance(value, str):
+        return value
+    # Escape control characters that can break FalkorDB query parsing
+    # Note: backslash must be escaped first to avoid double-escaping
+    value = value.replace('\\', '\\\\')
+    value = value.replace('\n', '\\n')
+    value = value.replace('\r', '\\r')
+    value = value.replace('\t', '\\t')
+    value = value.replace('\0', '')  # Remove null bytes entirely
+    return value
+
+
+def _sanitize_attributes(attributes: dict[str, Any] | None) -> dict[str, Any]:
+    """Sanitize attributes to only include primitive types that FalkorDB supports.
+
+    FalkorDB only supports primitive types (str, int, float, bool) or arrays of primitive types
+    as property values. This function filters out any non-primitive values.
+    """
+    if not attributes:
+        return {}
+
+    sanitized: dict[str, Any] = {}
+    for key, value in attributes.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, list):
+            # Only keep arrays of primitive types
+            if all(isinstance(item, (str, int, float, bool)) for item in value):
+                sanitized[key] = value
+            else:
+                logger.warning(
+                    f'Skipping attribute {key}: array contains non-primitive types'
+                )
+        else:
+            logger.warning(
+                f'Skipping attribute {key}: value type {type(value).__name__} is not supported by FalkorDB'
+            )
+    return sanitized
 
 
 def _build_directed_uuid_map(pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -161,6 +211,14 @@ async def add_nodes_and_edges_bulk_tx(
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
         episode.pop('labels', None)
+        # Sanitize string fields to prevent FalkorDB query parsing issues
+        if driver.provider == GraphProvider.FALKORDB:
+            if 'content' in episode and episode['content']:
+                episode['content'] = _sanitize_string_for_falkordb(episode['content'])
+            if 'name' in episode and episode['name']:
+                episode['name'] = _sanitize_string_for_falkordb(episode['name'])
+            if 'source_description' in episode and episode['source_description']:
+                episode['source_description'] = _sanitize_string_for_falkordb(episode['source_description'])
 
     nodes = []
 
@@ -168,11 +226,18 @@ async def add_nodes_and_edges_bulk_tx(
         if node.name_embedding is None:
             await node.generate_name_embedding(embedder)
 
+        # Sanitize string fields for FalkorDB
+        name = node.name
+        summary = node.summary
+        if driver.provider == GraphProvider.FALKORDB:
+            name = _sanitize_string_for_falkordb(name) if name else name
+            summary = _sanitize_string_for_falkordb(summary) if summary else summary
+
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
-            'name': node.name,
+            'name': name,
             'group_id': node.group_id,
-            'summary': node.summary,
+            'summary': summary,
             'created_at': node.created_at,
             'name_embedding': node.name_embedding,
             'labels': list(set(node.labels + ['Entity'])),
@@ -182,7 +247,8 @@ async def add_nodes_and_edges_bulk_tx(
             attributes = convert_datetimes_to_strings(node.attributes) if node.attributes else {}
             entity_data['attributes'] = json.dumps(attributes)
         else:
-            entity_data.update(node.attributes or {})
+            # Sanitize attributes to only include primitive types (FalkorDB requirement)
+            entity_data.update(_sanitize_attributes(node.attributes))
 
         nodes.append(entity_data)
 
@@ -190,12 +256,20 @@ async def add_nodes_and_edges_bulk_tx(
     for edge in entity_edges:
         if edge.fact_embedding is None:
             await edge.generate_embedding(embedder)
+
+        # Sanitize string fields for FalkorDB
+        edge_name = edge.name
+        edge_fact = edge.fact
+        if driver.provider == GraphProvider.FALKORDB:
+            edge_name = _sanitize_string_for_falkordb(edge_name) if edge_name else edge_name
+            edge_fact = _sanitize_string_for_falkordb(edge_fact) if edge_fact else edge_fact
+
         edge_data: dict[str, Any] = {
             'uuid': edge.uuid,
             'source_node_uuid': edge.source_node_uuid,
             'target_node_uuid': edge.target_node_uuid,
-            'name': edge.name,
-            'fact': edge.fact,
+            'name': edge_name,
+            'fact': edge_fact,
             'group_id': edge.group_id,
             'episodes': edge.episodes,
             'created_at': edge.created_at,
@@ -209,7 +283,8 @@ async def add_nodes_and_edges_bulk_tx(
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
             edge_data['attributes'] = json.dumps(attributes)
         else:
-            edge_data.update(edge.attributes or {})
+            # Sanitize attributes to only include primitive types (FalkorDB requirement)
+            edge_data.update(_sanitize_attributes(edge.attributes))
 
         edges.append(edge_data)
 
@@ -236,7 +311,12 @@ async def add_nodes_and_edges_bulk_tx(
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
     else:
-        await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
+        # Log bulk save operation details for debugging
+        episode_query = get_episode_node_save_bulk_query(driver.provider)
+        logger.info(f'[bulk_save] Saving {len(episodes)} episodes, query_len={len(episode_query)}, first_episode_uuid={episodes[0]["uuid"] if episodes else "none"}')
+        if not episode_query or not episode_query.strip():
+            logger.error(f'[bulk_save] Empty episode query! provider={driver.provider}, episodes_count={len(episodes)}')
+        await tx.run(episode_query, episodes=episodes)
         await tx.run(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,
@@ -245,10 +325,19 @@ async def add_nodes_and_edges_bulk_tx(
             get_episodic_edge_save_bulk_query(driver.provider),
             episodic_edges=[edge.model_dump() for edge in episodic_edges],
         )
-        await tx.run(
-            get_entity_edge_save_bulk_query(driver.provider),
-            entity_edges=edges,
-        )
+        # Group edges by type and save each group with the correct relationship type
+        # This is necessary because Cypher doesn't support dynamic relationship types
+        edges_by_type: dict[str, list[dict[str, Any]]] = {}
+        for edge in edges:
+            edge_type = edge.get('name', 'RELATES_TO')
+            if edge_type not in edges_by_type:
+                edges_by_type[edge_type] = []
+            edges_by_type[edge_type].append(edge)
+
+        for edge_type, typed_edges in edges_by_type.items():
+            query = get_entity_edge_save_bulk_query_by_type(driver.provider, edge_type)
+            logger.info(f'[bulk_save] Saving {len(typed_edges)} edges of type {edge_type}')
+            await tx.run(query, entity_edges=typed_edges)
 
 
 async def extract_nodes_and_edges_bulk(

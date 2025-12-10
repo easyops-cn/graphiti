@@ -184,6 +184,54 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
             )
 
 
+def get_entity_edge_save_bulk_query_by_type(provider: GraphProvider, edge_type: str) -> str:
+    """Generate edge save query for a specific edge type.
+
+    This is necessary because Cypher doesn't support dynamic relationship types.
+    We generate a query with the edge type hardcoded in the MERGE clause.
+    """
+    # Sanitize edge_type to prevent injection (only allow alphanumeric and underscore)
+    safe_edge_type = ''.join(c for c in edge_type if c.isalnum() or c == '_')
+    if not safe_edge_type:
+        safe_edge_type = 'RELATES_TO'
+
+    match provider:
+        case GraphProvider.FALKORDB:
+            return f"""
+                UNWIND $entity_edges AS edge
+                MATCH (source:Entity {{uuid: edge.source_node_uuid}})
+                MATCH (target:Entity {{uuid: edge.target_node_uuid}})
+                MERGE (source)-[r:{safe_edge_type} {{uuid: edge.uuid}}]->(target)
+                SET r = edge
+                SET r.fact_embedding = vecf32(edge.fact_embedding)
+                WITH r, edge
+                RETURN edge.uuid AS uuid
+            """
+        case GraphProvider.NEPTUNE:
+            return f"""
+                UNWIND $entity_edges AS edge
+                MATCH (source:Entity {{uuid: edge.source_node_uuid}})
+                MATCH (target:Entity {{uuid: edge.target_node_uuid}})
+                MERGE (source)-[r:{safe_edge_type} {{uuid: edge.uuid}}]->(target)
+                SET r = removeKeyFromMap(removeKeyFromMap(edge, "fact_embedding"), "episodes")
+                SET r.fact_embedding = join([x IN coalesce(edge.fact_embedding, []) | toString(x) ], ",")
+                SET r.episodes = join(edge.episodes, ",")
+                RETURN edge.uuid AS uuid
+            """
+        case _:
+            # For Neo4j and others
+            return f"""
+                UNWIND $entity_edges AS edge
+                MATCH (source:Entity {{uuid: edge.source_node_uuid}})
+                MATCH (target:Entity {{uuid: edge.target_node_uuid}})
+                MERGE (source)-[e:{safe_edge_type} {{uuid: edge.uuid}}]->(target)
+                SET e += edge
+                WITH e, edge
+                CALL db.create.setRelationshipVectorProperty(e, "fact_embedding", edge.fact_embedding)
+                RETURN edge.uuid AS uuid
+            """
+
+
 def get_entity_edge_return_query(provider: GraphProvider) -> str:
     # `fact_embedding` is not returned by default and must be manually loaded using `load_fact_embedding()`.
 

@@ -34,6 +34,11 @@ class Edge(BaseModel):
         ...,
         description='A natural language description of the relationship between the entities, paraphrased from the source text',
     )
+    reasoning: str = Field(
+        ...,
+        description='Brief reasoning (1-2 sentences) explaining why this relationship was extracted '
+        'and why the chosen relation_type accurately represents the relationship described in the text.',
+    )
     valid_at: str | None = Field(
         None,
         description='The date and time when the relationship described by the edge fact became true or was established. Use ISO 8601 format (YYYY-MM-DDTHH:MM:SS.SSSSSSZ)',
@@ -122,6 +127,10 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 5. The `fact` should closely paraphrase the original source sentence(s). Do not verbatim quote the original text.
 6. Use `REFERENCE_TIME` to resolve vague or relative temporal expressions (e.g., "last week").
 7. Do **not** hallucinate or infer temporal bounds from unrelated events.
+8. **Reasoning Requirement**: For each extracted edge, provide a brief `reasoning` (1-2 sentences) explaining:
+   - Why this relationship was extracted from the text
+   - Why the chosen relation_type accurately represents the relationship
+   - This forces careful consideration before extraction.
 
 # DATETIME RULES
 

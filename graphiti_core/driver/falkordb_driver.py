@@ -81,6 +81,9 @@ class FalkorDriverSession(GraphDriverSession):
 
     def __init__(self, graph: FalkorGraph):
         self.graph = graph
+        # Log graph name for debugging
+        graph_name = getattr(graph, 'name', getattr(graph, '_name', 'unknown'))
+        logger.debug(f'[FalkorDB] Created session for graph: {graph_name}')
 
     async def __aenter__(self):
         return self
@@ -99,14 +102,28 @@ class FalkorDriverSession(GraphDriverSession):
 
     async def run(self, query: str | list, **kwargs: Any) -> Any:
         # FalkorDB does not support argument for Label Set, so it's converted into an array of queries
+        graph_name = getattr(self.graph, 'name', getattr(self.graph, '_name', 'unknown'))
         if isinstance(query, list):
             for cypher, params in query:
                 params = convert_datetimes_to_strings(params)
+                logger.debug(f'[FalkorDB] graph={graph_name}, query={cypher[:200]}..., params_keys={list(params.keys()) if params else []}')
                 await self.graph.query(str(cypher), params)  # type: ignore[reportUnknownArgumentType]
         else:
             params = dict(kwargs)
             params = convert_datetimes_to_strings(params)
-            await self.graph.query(str(query), params)  # type: ignore[reportUnknownArgumentType]
+            # Validate query is not empty
+            if not query or not query.strip():
+                params_preview = {k: f'<{type(v).__name__}:{len(v) if isinstance(v, (list, dict, str)) else v}>' for k, v in params.items()} if params else {}
+                logger.error(f'[FalkorDB] Empty query detected! graph={graph_name}, params={params_preview}')
+                raise ValueError(f'Empty Cypher query for graph {graph_name}')
+            try:
+                await self.graph.query(str(query), params)  # type: ignore[reportUnknownArgumentType]
+            except Exception as e:
+                # Log query details on error for debugging
+                query_preview = str(query)[:300] if query else '<empty>'
+                params_preview = {k: f'<{type(v).__name__}:{len(v) if isinstance(v, (list, dict, str)) else v}>' for k, v in params.items()} if params else {}
+                logger.error(f'[FalkorDB] Query failed! graph={graph_name}, error={e}, query={query_preview}, params={params_preview}')
+                raise
         # Assuming `graph.query` is async (ideal); otherwise, wrap in executor
         return None
 
@@ -163,6 +180,7 @@ class FalkorDriver(GraphDriver):
         # FalkorDB requires a non-None database name for multi-tenant graphs; the default is "default_db"
         if graph_name is None:
             graph_name = self._database
+        logger.debug(f'[FalkorDB] _get_graph: requested={graph_name}, default={self._database}')
         return self.client.select_graph(graph_name)
 
     async def execute_query(self, cypher_query_, **kwargs: Any):
@@ -199,6 +217,8 @@ class FalkorDriver(GraphDriver):
         return records, header, None
 
     def session(self, database: str | None = None) -> GraphDriverSession:
+        effective_db = database if database is not None else self._database
+        logger.info(f'[FalkorDB] Creating session: requested_db={database}, effective_db={effective_db}')
         return FalkorDriverSession(self._get_graph(database))
 
     async def close(self) -> None:
@@ -290,8 +310,10 @@ class FalkorDriver(GraphDriver):
         """
         Replace FalkorDB special characters with whitespace.
         Based on FalkorDB tokenization rules: ,.<>{}[]"':;!@#$%^&*()-+=~
+        Also includes RediSearch query syntax characters: | /
         """
         # FalkorDB separator characters that break text into tokens
+        # Plus RediSearch special characters (| is OR operator, / can cause issues)
         separator_map = str.maketrans(
             {
                 ',': ' ',
@@ -321,6 +343,9 @@ class FalkorDriver(GraphDriver):
                 '=': ' ',
                 '~': ' ',
                 '?': ' ',
+                '|': ' ',  # RediSearch OR operator
+                '/': ' ',  # Path separator, can cause issues
+                '\\': ' ', # Backslash
             }
         )
         sanitized = query.translate(separator_map)

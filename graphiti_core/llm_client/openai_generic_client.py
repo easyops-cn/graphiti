@@ -16,6 +16,8 @@ limitations under the License.
 
 import json
 import logging
+import os
+import time
 import typing
 from typing import Any, ClassVar
 
@@ -87,10 +89,23 @@ class OpenAIGenericClient(LLMClient):
         # Override max_tokens to support higher limits for local models
         self.max_tokens = max_tokens
 
+        # Store base_url for endpoint detection
+        self._base_url = config.base_url
+        # Auto-detect if structured outputs should be used based on endpoint
+        self._use_structured_outputs = self._is_official_openai_endpoint(config.base_url)
+
         if client is None:
             self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
         else:
             self.client = client
+
+    def _is_official_openai_endpoint(self, base_url: str | None) -> bool:
+        """Check if the base_url is an official OpenAI endpoint that supports structured outputs."""
+        if base_url is None:
+            return True  # Default OpenAI endpoint
+        # Official OpenAI endpoints
+        official_hosts = ['api.openai.com', 'openai.azure.com']
+        return any(host in base_url for host in official_hosts)
 
     async def _generate_response(
         self,
@@ -106,10 +121,28 @@ class OpenAIGenericClient(LLMClient):
                 openai_messages.append({'role': 'user', 'content': m.content})
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
+
+        # Ensure "json" keyword exists in messages for APIs that require it (e.g., Alibaba Qwen)
+        has_json_keyword = any('json' in str(m.get('content', '')).lower() for m in openai_messages)
+        if not has_json_keyword and openai_messages:
+            # Add JSON instruction to the last user message or system message
+            for i in range(len(openai_messages) - 1, -1, -1):
+                if openai_messages[i]['role'] in ('user', 'system'):
+                    openai_messages[i]['content'] = str(openai_messages[i]['content']) + '\n\nRespond in JSON format.'
+                    break
+
         try:
+            # Use instance-level detection for structured output support
+            # Can still be overridden by environment variable
+            env_override = os.getenv('LLM_USE_JSON_SCHEMA')
+            if env_override is not None:
+                use_json_schema = env_override.lower() == 'true'
+            else:
+                use_json_schema = self._use_structured_outputs
+
             # Prepare response format
             response_format: dict[str, Any] = {'type': 'json_object'}
-            if response_model is not None:
+            if response_model is not None and use_json_schema:
                 schema_name = getattr(response_model, '__name__', 'structured_response')
                 json_schema = response_model.model_json_schema()
                 response_format = {
@@ -119,7 +152,130 @@ class OpenAIGenericClient(LLMClient):
                         'schema': json_schema,
                     },
                 }
+            elif response_model is not None:
+                # For non-official endpoints: add schema to prompt with example
+                json_schema = response_model.model_json_schema()
+                defs = json_schema.get('$defs', {})
 
+                def build_example_from_properties(props: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
+                    """Recursively build example from schema properties"""
+                    result = {}
+                    for field_name, field_info in props.items():
+                        field_type = field_info.get('type', 'string')
+                        # Check for $ref
+                        if '$ref' in field_info:
+                            ref_name = field_info['$ref'].split('/')[-1]
+                            if ref_name in defs:
+                                ref_props = defs[ref_name].get('properties', {})
+                                result[field_name] = build_example_from_properties(ref_props, defs)
+                            else:
+                                result[field_name] = {}
+                        # Check for enum in anyOf (common pattern for optional enums)
+                        elif 'anyOf' in field_info:
+                            any_of = field_info['anyOf']
+                            for option in any_of:
+                                if 'enum' in option:
+                                    result[field_name] = f'<one of {option["enum"]}>'
+                                    break
+                                elif '$ref' in option:
+                                    ref_name = option['$ref'].split('/')[-1]
+                                    if ref_name in defs:
+                                        ref_props = defs[ref_name].get('properties', {})
+                                        result[field_name] = build_example_from_properties(ref_props, defs)
+                                    break
+                            else:
+                                result[field_name] = None
+                        elif 'enum' in field_info:
+                            result[field_name] = f'<one of {field_info["enum"]}>'
+                        elif field_type == 'string':
+                            result[field_name] = f'<actual {field_name} value>'
+                        elif field_type == 'integer':
+                            result[field_name] = 0
+                        elif field_type == 'number':
+                            result[field_name] = 0.0
+                        elif field_type == 'boolean':
+                            result[field_name] = True
+                        elif field_type == 'array':
+                            # Build example array item from items schema
+                            items = field_info.get('items', {})
+                            if '$ref' in items:
+                                ref_name = items['$ref'].split('/')[-1]
+                                if ref_name in defs:
+                                    ref_props = defs[ref_name].get('properties', {})
+                                    item_example = build_example_from_properties(ref_props, defs)
+                                    result[field_name] = [item_example]
+                                else:
+                                    result[field_name] = ['<item>']
+                            elif items:
+                                item_type = items.get('type', 'string')
+                                if item_type == 'string':
+                                    result[field_name] = ['<item>']
+                                elif item_type == 'integer':
+                                    result[field_name] = [0]
+                                elif item_type == 'object':
+                                    item_props = items.get('properties', {})
+                                    result[field_name] = [build_example_from_properties(item_props, defs)]
+                                else:
+                                    result[field_name] = ['<item>']
+                            else:
+                                result[field_name] = ['<item>']
+                        else:
+                            result[field_name] = None
+                    return result
+
+                # Build example based on schema properties
+                example = {}
+                enum_constraints = []  # Collect enum constraints for explicit instruction
+                properties = json_schema.get('properties', {})
+
+                # First pass: collect enum constraints
+                def collect_enum_constraints(props: dict[str, Any], defs: dict[str, Any], prefix: str = ''):
+                    """Recursively collect enum constraints from schema"""
+                    constraints = []
+                    for field_name, field_info in props.items():
+                        full_name = f'{prefix}{field_name}' if prefix else field_name
+                        # Check for enum in anyOf
+                        if 'anyOf' in field_info:
+                            for option in field_info['anyOf']:
+                                if 'enum' in option:
+                                    constraints.append(f'- "{full_name}" must be one of: {option["enum"]}')
+                                    break
+                        elif 'enum' in field_info:
+                            constraints.append(f'- "{full_name}" must be one of: {field_info["enum"]}')
+                        # Check array items
+                        elif field_info.get('type') == 'array':
+                            items = field_info.get('items', {})
+                            if '$ref' in items:
+                                ref_name = items['$ref'].split('/')[-1]
+                                if ref_name in defs:
+                                    ref_props = defs[ref_name].get('properties', {})
+                                    constraints.extend(collect_enum_constraints(ref_props, defs, f'{full_name}[].'))
+                    return constraints
+
+                enum_constraints = collect_enum_constraints(properties, defs)
+                example = build_example_from_properties(properties, defs)
+
+                schema_hint = (
+                    f'\n\nRespond with a JSON object matching this schema:\n{json.dumps(json_schema, ensure_ascii=False)}'
+                    f'\n\nExample response format (replace placeholders with actual extracted values):\n{json.dumps(example, ensure_ascii=False, indent=2)}'
+                    f'\n\nDo NOT wrap the response in "properties" or any other container. Return the fields directly at the top level.'
+                )
+                # Add explicit enum constraints if any
+                if enum_constraints:
+                    schema_hint += f'\n\nIMPORTANT - Enum constraints (you MUST use exactly one of these values, do NOT use any other value):\n' + '\n'.join(enum_constraints)
+                for i in range(len(openai_messages) - 1, -1, -1):
+                    if openai_messages[i]['role'] in ('user', 'system'):
+                        openai_messages[i]['content'] = str(openai_messages[i]['content']) + schema_hint
+                        break
+
+            # Log request before API call
+            logger.info(f'[LLM] >>> model={self.model}, response_model={response_model.__name__ if response_model else None}')
+            # Log all messages (full content for debugging)
+            for i, msg in enumerate(openai_messages):
+                msg_content = str(msg.get('content', ''))
+                logger.info(f'[LLM] >>> request msg[{i}] role={msg.get("role")}: {msg_content}')
+
+            start_time = time.time()
             response = await self.client.chat.completions.create(
                 model=self.model or DEFAULT_MODEL,
                 messages=openai_messages,
@@ -127,13 +283,54 @@ class OpenAIGenericClient(LLMClient):
                 max_tokens=self.max_tokens,
                 response_format=response_format,  # type: ignore[arg-type]
             )
+            elapsed_ms = (time.time() - start_time) * 1000
             result = response.choices[0].message.content or ''
-            return json.loads(result)
+            # Log response after API call (full content)
+            logger.info(f'[LLM] <<< response ({elapsed_ms:.0f}ms): {result}')
+            parsed = json.loads(result)
+
+            # Validate with response_model if provided (for non-official endpoints)
+            if response_model is not None and not use_json_schema:
+                try:
+                    response_model.model_validate(parsed)
+                except Exception as validation_error:
+                    # Try to fix common LLM output errors
+                    fixed = self._fix_common_json_errors(parsed, response_model)
+                    if fixed != parsed:
+                        logger.warning(f'[LLM] Fixed JSON output errors, retrying validation')
+                        try:
+                            response_model.model_validate(fixed)
+                            return fixed
+                        except Exception:
+                            pass
+                    # Re-raise original validation error to trigger retry
+                    logger.warning(f'[LLM] Validation failed: {validation_error}')
+                    raise validation_error
+
+            return parsed
         except openai.RateLimitError as e:
             raise RateLimitError from e
         except Exception as e:
             logger.error(f'Error in generating LLM response: {e}')
             raise
+
+    def _fix_common_json_errors(self, data: Any, response_model: type[BaseModel]) -> Any:
+        """
+        Fix common JSON output errors from LLM, such as:
+        - 'name:' instead of 'name' (extra colon in key)
+        - Missing required fields that can be inferred
+        """
+        if isinstance(data, dict):
+            fixed = {}
+            for key, value in data.items():
+                # Fix keys with trailing colon (e.g., 'name:' -> 'name')
+                fixed_key = key.rstrip(':') if key.endswith(':') else key
+                fixed[fixed_key] = self._fix_common_json_errors(value, response_model)
+            return fixed
+        elif isinstance(data, list):
+            return [self._fix_common_json_errors(item, response_model) for item in data]
+        else:
+            return data
 
     async def generate_response(
         self,

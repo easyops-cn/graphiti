@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
+import logging
 import typing
 
 from openai import AsyncOpenAI
@@ -22,6 +24,8 @@ from pydantic import BaseModel
 
 from .config import DEFAULT_MAX_TOKENS, LLMConfig
 from .openai_base_client import DEFAULT_REASONING, DEFAULT_VERBOSITY, BaseOpenAIClient
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIClient(BaseOpenAIClient):
@@ -57,10 +61,23 @@ class OpenAIClient(BaseOpenAIClient):
         if config is None:
             config = LLMConfig()
 
+        self._base_url = config.base_url
+        self._use_structured_outputs = self._is_official_openai_endpoint(config.base_url)
+
         if client is None:
             self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
         else:
             self.client = client
+
+    def _is_official_openai_endpoint(self, base_url: str | None) -> bool:
+        """Check if the base_url is an official OpenAI endpoint that supports structured outputs."""
+        if base_url is None:
+            return True  # Default OpenAI endpoint
+        # Official OpenAI endpoints
+        official_hosts = ['api.openai.com', 'openai.azure.com']
+        is_official = any(host in base_url for host in official_hosts)
+        logger.info(f'[OpenAIClient] base_url={base_url}, is_official={is_official}, use_structured_outputs={is_official}')
+        return is_official
 
     async def _create_structured_completion(
         self,
@@ -72,12 +89,20 @@ class OpenAIClient(BaseOpenAIClient):
         reasoning: str | None = None,
         verbosity: str | None = None,
     ):
-        """Create a structured completion using OpenAI's beta parse API."""
+        """Create a structured completion using OpenAI's beta parse API or fallback for non-official endpoints."""
         # Reasoning models (gpt-5 family) don't support temperature
         is_reasoning_model = (
             model.startswith('gpt-5') or model.startswith('o1') or model.startswith('o3')
         )
 
+        # For non-official endpoints, use fallback to chat.completions with schema in prompt
+        if not self._use_structured_outputs:
+            logger.info(f'[OpenAIClient] Using fallback for non-official endpoint, model={model}, response_model={response_model.__name__}')
+            return await self._create_structured_completion_fallback(
+                model, messages, temperature, max_tokens, response_model, is_reasoning_model
+            )
+
+        logger.info(f'[OpenAIClient] Using responses.parse API, model={model}')
         response = await self.client.responses.parse(
             model=model,
             input=messages,  # type: ignore
@@ -89,6 +114,69 @@ class OpenAIClient(BaseOpenAIClient):
         )
 
         return response
+
+    async def _create_structured_completion_fallback(
+        self,
+        model: str,
+        messages: list[ChatCompletionMessageParam],
+        temperature: float | None,
+        max_tokens: int,
+        response_model: type[BaseModel],
+        is_reasoning_model: bool,
+    ):
+        """Fallback for non-official endpoints: add schema to prompt and use chat.completions."""
+        # Generate a clean schema description for the prompt
+        schema = response_model.model_json_schema()
+
+        # Build a cleaner prompt that describes expected fields
+        field_descriptions = []
+        properties = schema.get('properties', {})
+        required = schema.get('required', [])
+
+        for field_name, field_info in properties.items():
+            field_type = field_info.get('type', 'string')
+            field_desc = field_info.get('description', '')
+            is_required = field_name in required
+
+            # Handle enum types
+            if 'enum' in field_info:
+                enum_values = ', '.join(f'"{v}"' for v in field_info['enum'])
+                field_type = f'enum ({enum_values})'
+
+            req_marker = '(required)' if is_required else '(optional)'
+            field_descriptions.append(f'  - {field_name}: {field_type} {req_marker} - {field_desc}')
+
+        schema_prompt = (
+            f'\n\nRespond with a JSON object containing the following fields:\n'
+            + '\n'.join(field_descriptions)
+            + '\n\nIMPORTANT: Return ONLY the JSON object with actual values, NOT the schema definition.'
+        )
+
+        # Append schema to last message
+        modified_messages = list(messages)
+        if modified_messages:
+            last_msg = modified_messages[-1]
+            if isinstance(last_msg, dict) and 'content' in last_msg:
+                modified_messages[-1] = {
+                    **last_msg,
+                    'content': last_msg['content'] + schema_prompt
+                }
+
+        response = await self.client.chat.completions.create(
+            model=model,
+            messages=modified_messages,
+            temperature=temperature if not is_reasoning_model else None,
+            max_tokens=max_tokens,
+            response_format={'type': 'json_object'},
+        )
+
+        # Wrap response to match structured output format
+        class FallbackResponse:
+            def __init__(self, content: str):
+                self.output_text = content
+
+        content = response.choices[0].message.content or '{}'
+        return FallbackResponse(content)
 
     async def _create_completion(
         self,

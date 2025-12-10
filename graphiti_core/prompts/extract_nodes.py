@@ -16,7 +16,7 @@ limitations under the License.
 
 from typing import Any, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
@@ -26,15 +26,28 @@ from .snippets import summary_instructions
 
 
 class ExtractedEntity(BaseModel):
-    name: str = Field(..., description='Name of the extracted entity')
+    name: str = Field(
+        ...,
+        description='Name of the extracted entity',
+        validation_alias=AliasChoices('name', 'entity_name'),
+    )
     entity_type_id: int = Field(
         description='ID of the classified entity type. '
         'Must be one of the provided entity_type_id integers.',
     )
+    reasoning: str = Field(
+        ...,
+        description='Brief reasoning (1-2 sentences) explaining why this entity was extracted '
+        'and why the chosen entity_type_id is correct based on the ENTITY TYPES descriptions.',
+    )
 
 
 class ExtractedEntities(BaseModel):
-    extracted_entities: list[ExtractedEntity] = Field(..., description='List of extracted entities')
+    extracted_entities: list[ExtractedEntity] = Field(
+        ...,
+        description='List of extracted entities',
+        validation_alias=AliasChoices('extracted_entities', 'entities'),
+    )
 
 
 class MissedEntities(BaseModel):
@@ -103,7 +116,7 @@ def extract_message(context: dict[str, Any]) -> list[Message]:
 Instructions:
 
 You are given a conversation context and a CURRENT MESSAGE. Your task is to extract **entity nodes** mentioned **explicitly or implicitly** in the CURRENT MESSAGE.
-Pronoun references such as he/she/they or this/that/those should be disambiguated to the names of the 
+Pronoun references such as he/she/they or this/that/those should be disambiguated to the names of the
 reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don't extract pronouns like you, me, he/she/they, we/us as entities.
 
 1. **Speaker Extraction**: Always extract the speaker (the part before the colon `:` in each dialogue line) as the first entity node.
@@ -116,12 +129,19 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
 3. **Entity Classification**:
    - Use the descriptions in ENTITY TYPES to classify each extracted entity.
    - Assign the appropriate `entity_type_id` for each one.
+   - **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each entity type description to ensure correct classification.
 
-4. **Exclusions**:
+4. **Reasoning Requirement**:
+   - For each extracted entity, provide a brief `reasoning` (1-2 sentences) explaining:
+     - Why you identified this as a significant entity
+     - Why the chosen entity_type_id is correct based on the ENTITY TYPES descriptions
+   - This forces careful consideration before classification.
+
+5. **Exclusions**:
    - Do NOT extract entities representing relationships or actions.
    - Do NOT extract dates, times, or other temporal information—these will be handled separately.
 
-5. **Formatting**:
+6. **Formatting**:
    - Be **explicit and unambiguous** in naming entities (e.g., use full names when available).
 
 {context['custom_prompt']}
@@ -189,6 +209,11 @@ Guidelines:
 2. Avoid creating nodes for relationships or actions.
 3. Avoid creating nodes for temporal information like dates, times or years (these will be added to edges later).
 4. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
+5. **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each entity type description to ensure correct classification.
+6. **Reasoning Requirement**: For each extracted entity, provide a brief `reasoning` (1-2 sentences) explaining:
+   - Why you identified this as a significant entity
+   - Why the chosen entity_type_id is correct based on the ENTITY TYPES descriptions
+   - This forces careful consideration before classification.
 """
     return [
         Message(role='system', content=sys_prompt),

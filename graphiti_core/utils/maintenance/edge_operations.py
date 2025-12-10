@@ -96,6 +96,7 @@ async def extract_edges(
     edge_types: dict[str, type[BaseModel]] | None = None,
 ) -> list[EntityEdge]:
     start = time()
+    perf_logger = logging.getLogger('graphiti.performance')
 
     extract_edges_max_tokens = 16384
     llm_client = clients.llm_client
@@ -134,7 +135,9 @@ async def extract_edges(
 
     facts_missed = True
     reflexion_iterations = 0
+    llm_call_count = 0
     while facts_missed and reflexion_iterations <= MAX_REFLEXION_ITERATIONS:
+        llm_start = time()
         llm_response = await llm_client.generate_response(
             prompt_library.extract_edges.edge(context),
             response_model=ExtractedEdges,
@@ -142,12 +145,15 @@ async def extract_edges(
             group_id=group_id,
             prompt_name='extract_edges.edge',
         )
+        llm_call_count += 1
+        perf_logger.info(f'[PERF]       └─ extract_edges LLM call #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
         edges_data = ExtractedEdges(**llm_response).edges
 
         context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
 
         reflexion_iterations += 1
         if reflexion_iterations < MAX_REFLEXION_ITERATIONS:
+            llm_start = time()
             reflexion_response = await llm_client.generate_response(
                 prompt_library.extract_edges.reflexion(context),
                 response_model=MissingFacts,
@@ -155,6 +161,8 @@ async def extract_edges(
                 group_id=group_id,
                 prompt_name='extract_edges.reflexion',
             )
+            llm_call_count += 1
+            perf_logger.info(f'[PERF]       └─ extract_edges reflexion #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
             missing_facts = reflexion_response.get('missing_facts', [])
 
@@ -168,6 +176,7 @@ async def extract_edges(
 
     end = time()
     logger.debug(f'Extracted new edges: {edges_data} in {(end - start) * 1000} ms')
+    perf_logger.info(f'[PERF]     └─ extract_edges TOTAL: {(end - start)*1000:.0f}ms, edges={len(edges_data)}, llm_calls={llm_call_count}')
 
     if len(edges_data) == 0:
         return []
@@ -246,6 +255,9 @@ async def resolve_extracted_edges(
     edge_types: dict[str, type[BaseModel]],
     edge_type_map: dict[tuple[str, str], list[str]],
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
+    perf_logger = logging.getLogger('graphiti.performance')
+    resolve_start = time()
+
     # Fast path: deduplicate exact matches within the extracted edges before parallel processing
     seen: dict[tuple[str, str, str], EntityEdge] = {}
     deduplicated_edges: list[EntityEdge] = []
@@ -261,19 +273,35 @@ async def resolve_extracted_edges(
             deduplicated_edges.append(edge)
 
     extracted_edges = deduplicated_edges
+    perf_logger.info(f'[PERF]     └─ dedup_extracted_edges: edges_count={len(extracted_edges)}')
 
     driver = clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder
-    await create_entity_edge_embeddings(embedder, extracted_edges)
 
+    step_start = time()
+    await create_entity_edge_embeddings(embedder, extracted_edges)
+    perf_logger.info(f'[PERF]     └─ create_edge_embeddings (Embedding): {(time() - step_start)*1000:.0f}ms')
+
+    step_start = time()
     valid_edges_list: list[list[EntityEdge]] = await semaphore_gather(
         *[
             EntityEdge.get_between_nodes(driver, edge.source_node_uuid, edge.target_node_uuid)
             for edge in extracted_edges
         ]
     )
+    perf_logger.info(f'[PERF]     └─ get_between_nodes (DB): {(time() - step_start)*1000:.0f}ms')
 
+    # Pre-batch embeddings for all edge facts to avoid per-search embedding calls
+    step_start = time()
+    edge_facts = [edge.fact.replace('\n', ' ') for edge in extracted_edges]
+    if edge_facts:
+        fact_query_embeddings = await embedder.create_batch(edge_facts)
+    else:
+        fact_query_embeddings = []
+    perf_logger.info(f'[PERF]     └─ batch_search_embeddings: {(time() - step_start)*1000:.0f}ms, count={len(edge_facts)}')
+
+    step_start = time()
     related_edges_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -282,13 +310,16 @@ async def resolve_extracted_edges(
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
                 search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
+                query_vector=fact_query_embeddings[i] if i < len(fact_query_embeddings) else None,
             )
-            for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
+            for i, (extracted_edge, valid_edges) in enumerate(zip(extracted_edges, valid_edges_list, strict=True))
         ]
     )
+    perf_logger.info(f'[PERF]     └─ search_related_edges (Hybrid): {(time() - step_start)*1000:.0f}ms')
 
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
 
+    step_start = time()
     edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -297,10 +328,12 @@ async def resolve_extracted_edges(
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
                 search_filter=SearchFilters(),
+                query_vector=fact_query_embeddings[i] if i < len(fact_query_embeddings) else None,
             )
-            for extracted_edge in extracted_edges
+            for i, extracted_edge in enumerate(extracted_edges)
         ]
     )
+    perf_logger.info(f'[PERF]     └─ search_invalidation_candidates (Hybrid): {(time() - step_start)*1000:.0f}ms')
 
     edge_invalidation_candidates: list[list[EntityEdge]] = [
         result.edges for result in edge_invalidation_candidate_results
@@ -361,6 +394,7 @@ async def resolve_extracted_edges(
             extracted_edge.name = DEFAULT_EDGE_NAME
 
     # resolve edges with related edges in the graph and find invalidation candidates
+    step_start = time()
     results: list[tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]] = list(
         await semaphore_gather(
             *[
@@ -383,6 +417,7 @@ async def resolve_extracted_edges(
             ]
         )
     )
+    perf_logger.info(f'[PERF]     └─ resolve_extracted_edge (LLM x{len(extracted_edges)}): {(time() - step_start)*1000:.0f}ms')
 
     resolved_edges: list[EntityEdge] = []
     invalidated_edges: list[EntityEdge] = []
@@ -395,10 +430,14 @@ async def resolve_extracted_edges(
 
     logger.debug(f'Resolved edges: {[(e.name, e.uuid) for e in resolved_edges]}')
 
+    step_start = time()
     await semaphore_gather(
         create_entity_edge_embeddings(embedder, resolved_edges),
         create_entity_edge_embeddings(embedder, invalidated_edges),
     )
+    perf_logger.info(f'[PERF]     └─ final_embeddings (Embedding): {(time() - step_start)*1000:.0f}ms')
+
+    perf_logger.info(f'[PERF]     └─ resolve_extracted_edges TOTAL: {(time() - resolve_start)*1000:.0f}ms')
 
     return resolved_edges, invalidated_edges
 

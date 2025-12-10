@@ -42,6 +42,7 @@ from graphiti_core.helpers import (
     validate_excluded_entity_types,
     validate_group_id,
 )
+from graphiti_core.hooks import PreWriteHook
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.nodes import (
     CommunityNode,
@@ -139,6 +140,7 @@ class Graphiti:
         max_coroutines: int | None = None,
         tracer: Tracer | None = None,
         trace_span_prefix: str = 'graphiti',
+        pre_write_hook: 'PreWriteHook | None' = None,
     ):
         """
         Initialize a Graphiti instance.
@@ -219,6 +221,9 @@ class Graphiti:
 
         # Initialize tracer
         self.tracer = create_tracer(tracer, trace_span_prefix)
+
+        # Initialize pre-write hook
+        self.pre_write_hook = pre_write_hook
 
         # Set tracer on clients
         self.llm_client.set_tracer(self.tracer)
@@ -386,6 +391,9 @@ class Graphiti:
         uuid_map: dict[str, str],
     ) -> tuple[list[EntityEdge], list[EntityEdge]]:
         """Extract edges from episode and resolve against existing graph."""
+        perf_logger = logging.getLogger('graphiti.performance')
+
+        step_start = time()
         extracted_edges = await extract_edges(
             self.clients,
             episode,
@@ -395,9 +403,13 @@ class Graphiti:
             group_id,
             edge_types,
         )
+        perf_logger.info(f'[PERF]   └─ extract_edges (LLM): {(time() - step_start)*1000:.0f}ms, count={len(extracted_edges)}')
 
+        step_start = time()
         edges = resolve_edge_pointers(extracted_edges, uuid_map)
+        perf_logger.info(f'[PERF]   └─ resolve_edge_pointers: {(time() - step_start)*1000:.0f}ms')
 
+        step_start = time()
         resolved_edges, invalidated_edges = await resolve_extracted_edges(
             self.clients,
             edges,
@@ -406,6 +418,7 @@ class Graphiti:
             edge_types or {},
             edge_type_map,
         )
+        perf_logger.info(f'[PERF]   └─ resolve_extracted_edges: {(time() - step_start)*1000:.0f}ms, resolved={len(resolved_edges)}, invalidated={len(invalidated_edges)}')
 
         return resolved_edges, invalidated_edges
 
@@ -686,6 +699,9 @@ class Graphiti:
         start = time()
         now = utc_now()
 
+        # 添加性能日志
+        perf_logger = logging.getLogger('graphiti.performance')
+
         validate_entity_types(entity_types)
         validate_excluded_entity_types(excluded_entity_types, entity_types)
 
@@ -703,6 +719,7 @@ class Graphiti:
         with self.tracer.start_span('add_episode') as span:
             try:
                 # Retrieve previous episodes for context
+                step_start = time()
                 previous_episodes = (
                     await self.retrieve_episodes(
                         reference_time,
@@ -713,6 +730,7 @@ class Graphiti:
                     if previous_episode_uuids is None
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
                 )
+                perf_logger.info(f'[PERF] retrieve_episodes: {(time() - step_start)*1000:.0f}ms, count={len(previous_episodes)}')
 
                 # Get or create episode
                 episode = (
@@ -737,47 +755,82 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
-                # Extract and resolve nodes
+                # Extract nodes
+                step_start = time()
                 extracted_nodes = await extract_nodes(
                     self.clients, episode, previous_episodes, entity_types, excluded_entity_types
                 )
+                perf_logger.info(f'[PERF] extract_nodes (LLM): {(time() - step_start)*1000:.0f}ms, count={len(extracted_nodes)}')
 
-                nodes, uuid_map, _ = await resolve_extracted_nodes(
+                # OPTIMIZATION: Run resolve_extracted_nodes and extract_edges in parallel
+                # Both only need extracted_nodes, not resolved nodes
+                step_start = time()
+                resolve_task = resolve_extracted_nodes(
                     self.clients,
                     extracted_nodes,
                     episode,
                     previous_episodes,
                     entity_types,
                 )
-
-                # Extract and resolve edges in parallel with attribute extraction
-                resolved_edges, invalidated_edges = await self._extract_and_resolve_edges(
+                extract_edges_task = extract_edges(
+                    self.clients,
                     episode,
                     extracted_nodes,
                     previous_episodes,
                     edge_type_map or edge_type_map_default,
                     group_id,
                     edge_types,
-                    nodes,
-                    uuid_map,
                 )
+                (nodes, uuid_map, _), extracted_edges = await semaphore_gather(
+                    resolve_task, extract_edges_task
+                )
+                perf_logger.info(f'[PERF] resolve_nodes + extract_edges (parallel): {(time() - step_start)*1000:.0f}ms, nodes={len(nodes)}, edges={len(extracted_edges)}')
 
-                # Extract node attributes
-                hydrated_nodes = await extract_attributes_from_nodes(
+                # Resolve edge pointers
+                step_start = time()
+                edges_with_pointers = resolve_edge_pointers(extracted_edges, uuid_map)
+                perf_logger.info(f'[PERF] resolve_edge_pointers: {(time() - step_start)*1000:.0f}ms')
+
+                # OPTIMIZATION: Run resolve_extracted_edges and extract_attributes_from_nodes in parallel
+                step_start = time()
+                resolve_edges_task = resolve_extracted_edges(
+                    self.clients,
+                    edges_with_pointers,
+                    episode,
+                    nodes,
+                    edge_types or {},
+                    edge_type_map or edge_type_map_default,
+                )
+                extract_attrs_task = extract_attributes_from_nodes(
                     self.clients, nodes, episode, previous_episodes, entity_types
                 )
+                (resolved_edges, invalidated_edges), hydrated_nodes = await semaphore_gather(
+                    resolve_edges_task, extract_attrs_task
+                )
+                perf_logger.info(f'[PERF] resolve_edges + extract_attrs (parallel): {(time() - step_start)*1000:.0f}ms, resolved={len(resolved_edges)}, invalidated={len(invalidated_edges)}')
 
                 entity_edges = resolved_edges + invalidated_edges
 
+                # Call pre-write hook if configured
+                if self.pre_write_hook:
+                    step_start = time()
+                    entity_edges = await self.pre_write_hook.validate_edges(
+                        entity_edges, hydrated_nodes, group_id
+                    )
+                    perf_logger.info(f'[PERF] pre_write_hook.validate_edges: {(time() - step_start)*1000:.0f}ms')
+
                 # Process and save episode data
+                step_start = time()
                 episodic_edges, episode = await self._process_episode_data(
                     episode, hydrated_nodes, entity_edges, now
                 )
+                perf_logger.info(f'[PERF] _process_episode_data (DB write): {(time() - step_start)*1000:.0f}ms')
 
                 # Update communities if requested
                 communities = []
                 community_edges = []
                 if update_communities:
+                    step_start = time()
                     communities, community_edges = await semaphore_gather(
                         *[
                             update_community(self.driver, self.llm_client, self.embedder, node)
@@ -785,8 +838,10 @@ class Graphiti:
                         ],
                         max_coroutines=self.max_coroutines,
                     )
+                    perf_logger.info(f'[PERF] update_communities: {(time() - step_start)*1000:.0f}ms')
 
                 end = time()
+                perf_logger.info(f'[PERF] add_episode TOTAL: {(end - start)*1000:.0f}ms')
 
                 # Add span attributes
                 span.add_attributes(
