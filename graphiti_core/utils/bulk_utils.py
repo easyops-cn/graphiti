@@ -57,6 +57,9 @@ from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
     retrieve_episodes,
 )
+from graphiti_core.llm_client import LLMClient
+from graphiti_core.prompts import prompt_library
+from graphiti_core.prompts.dedupe_nodes import NodeResolutions
 from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes,
     resolve_extracted_nodes,
@@ -65,6 +68,197 @@ from graphiti_core.utils.maintenance.node_operations import (
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 10
+
+
+def _get_entity_type_label(node: EntityNode) -> str:
+    """Get the most specific entity type label (non-'Entity') from a node."""
+    for label in node.labels:
+        if label != 'Entity':
+            return label
+    return 'Entity'
+
+
+async def _resolve_batch_with_llm(
+    llm_client: LLMClient,
+    unresolved_nodes: list[EntityNode],
+    canonical_candidates: list[EntityNode],
+    entity_types: dict[str, type[BaseModel]] | None,
+) -> list[tuple[EntityNode, EntityNode]]:
+    """Use LLM to resolve semantic duplicates that deterministic matching missed.
+
+    EasyOps customization: Enables batch-internal deduplication of semantic synonyms
+    like 'EasyITSM' vs 'IT服务中心' that cannot be matched by exact string or MinHash.
+
+    Returns:
+        List of (source_node, canonical_node) pairs for detected duplicates.
+    """
+    if not unresolved_nodes or not canonical_candidates:
+        return []
+
+    entity_types_dict = entity_types or {}
+
+    # Build context for extracted nodes (unresolved)
+    extracted_nodes_context = []
+    for i, node in enumerate(unresolved_nodes):
+        entity_type_label = _get_entity_type_label(node)
+        type_model = entity_types_dict.get(entity_type_label)
+        extracted_nodes_context.append({
+            'id': i,
+            'name': node.name,
+            'summary': node.summary or '',
+            'entity_type': node.labels,
+            'entity_type_description': type_model.__doc__ if type_model else 'Default Entity Type',
+        })
+
+    # Build context for existing candidates (canonical pool)
+    existing_nodes_context = [
+        {
+            'idx': i,
+            'name': candidate.name,
+            'summary': candidate.summary or '',
+            'entity_types': candidate.labels,
+            **candidate.attributes,
+        }
+        for i, candidate in enumerate(canonical_candidates)
+    ]
+
+    context = {
+        'extracted_nodes': extracted_nodes_context,
+        'existing_nodes': existing_nodes_context,
+        'episode_content': '',
+        'previous_episodes': [],
+    }
+
+    logger.info(
+        '[batch_dedup_llm] Sending %d nodes to LLM against %d candidates',
+        len(unresolved_nodes),
+        len(canonical_candidates),
+    )
+
+    try:
+        llm_response = await llm_client.generate_response(
+            prompt_library.dedupe_nodes.nodes(context),
+            response_model=NodeResolutions,
+            prompt_name='dedupe_nodes.nodes_batch',
+        )
+
+        node_resolutions = NodeResolutions(**llm_response).entity_resolutions
+        duplicate_pairs: list[tuple[EntityNode, EntityNode]] = []
+
+        for resolution in node_resolutions:
+            node_id = resolution.id
+            duplicate_idx = resolution.duplicate_idx
+
+            if node_id < 0 or node_id >= len(unresolved_nodes):
+                continue
+            if duplicate_idx == -1:
+                continue
+            if duplicate_idx < 0 or duplicate_idx >= len(canonical_candidates):
+                continue
+
+            source_node = unresolved_nodes[node_id]
+            canonical_node = canonical_candidates[duplicate_idx]
+
+            if source_node.uuid != canonical_node.uuid:
+                logger.info(
+                    '[batch_dedup_llm] Duplicate found: "%s" -> "%s"',
+                    source_node.name,
+                    canonical_node.name,
+                )
+                duplicate_pairs.append((source_node, canonical_node))
+
+        return duplicate_pairs
+
+    except Exception as e:
+        logger.error('[batch_dedup_llm] LLM dedup failed: %s', e)
+        return []
+
+
+def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode) -> None:
+    """Merge source node's summary and attributes into canonical node.
+
+    EasyOps customization: When LLM identifies duplicates, merge their information
+    to preserve all extracted knowledge.
+    """
+    # Merge summary: concatenate if both exist, prefer non-empty
+    if source.summary and canonical.summary:
+        if source.summary not in canonical.summary:
+            canonical.summary = f"{canonical.summary} {source.summary}"
+    elif source.summary and not canonical.summary:
+        canonical.summary = source.summary
+
+    # Merge attributes: source attributes fill in missing canonical attributes
+    for key, value in source.attributes.items():
+        if key not in canonical.attributes or not canonical.attributes[key]:
+            canonical.attributes[key] = value
+
+
+async def semantic_dedupe_nodes_bulk(
+    clients: GraphitiClients,
+    nodes: list[EntityNode],
+    entity_types: dict[str, type[BaseModel]] | None = None,
+) -> list[EntityNode]:
+    """Perform LLM-based semantic deduplication on hydrated nodes.
+
+    EasyOps customization: Run after extract_attributes_from_nodes so that
+    summary and attributes are available for LLM to make better decisions.
+
+    Groups nodes by entity type and uses LLM to identify semantic duplicates
+    (e.g., 'EasyITSM' vs 'IT服务中心') that deterministic matching cannot handle.
+
+    Returns:
+        Deduplicated list of nodes with merged summaries and attributes.
+    """
+    if len(nodes) < 2:
+        return nodes
+
+    # Group nodes by entity type
+    nodes_by_type: dict[str, list[EntityNode]] = {}
+    for node in nodes:
+        entity_type = _get_entity_type_label(node)
+        if entity_type not in nodes_by_type:
+            nodes_by_type[entity_type] = []
+        nodes_by_type[entity_type].append(node)
+
+    # Track which nodes are duplicates (uuid -> canonical_uuid)
+    duplicate_map: dict[str, str] = {}
+    nodes_by_uuid: dict[str, EntityNode] = {node.uuid: node for node in nodes}
+
+    # For each entity type with multiple nodes, check for semantic duplicates
+    for entity_type, type_nodes in nodes_by_type.items():
+        if len(type_nodes) < 2:
+            continue
+
+        logger.info(
+            '[semantic_dedup] Checking %d %s entities for semantic duplicates',
+            len(type_nodes), entity_type,
+        )
+
+        # Check each node against others of same type
+        for i, node in enumerate(type_nodes):
+            if node.uuid in duplicate_map:
+                continue  # Already identified as duplicate
+
+            candidates = [n for n in type_nodes[i+1:] if n.uuid not in duplicate_map]
+            if not candidates:
+                continue
+
+            llm_pairs = await _resolve_batch_with_llm(
+                clients.llm_client, [node], candidates, entity_types
+            )
+
+            for source, canonical in llm_pairs:
+                # Merge source into canonical
+                _merge_node_into_canonical(source, canonical)
+                duplicate_map[source.uuid] = canonical.uuid
+                logger.info(
+                    '[semantic_dedup] Merged "%s" into "%s"',
+                    source.name, canonical.name,
+                )
+
+    # Return deduplicated nodes
+    deduped_nodes = [node for node in nodes if node.uuid not in duplicate_map]
+    return deduped_nodes
 
 
 def _sanitize_string_for_falkordb(value: str) -> str:

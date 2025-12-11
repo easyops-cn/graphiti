@@ -27,6 +27,13 @@ class EdgeDuplicate(BaseModel):
         ...,
         description='List of idx values of any duplicate facts. If no duplicate facts are found, default to empty list.',
     )
+    merged_fact: str | None = Field(
+        default=None,
+        description='When duplicate_facts is not empty, provide a merged fact that combines the semantic meaning of '
+        'both the NEW FACT and the EXISTING FACT(s). The merged fact should be a concise, comprehensive '
+        'description that captures all unique information from both facts without redundancy. '
+        'Return null if no duplicates are found.',
+    )
     contradicted_facts: list[int] = Field(
         ...,
         description='List of idx values of facts that should be invalidated. If no facts should be invalidated, the list should be empty.',
@@ -133,12 +140,20 @@ def resolve_edge(context: dict[str, Any]) -> list[Message]:
         You will receive TWO separate lists of facts. Each list uses 'idx' as its index field, starting from 0.
 
         1. DUPLICATE DETECTION:
-           - If the NEW FACT represents identical factual information as any fact in EXISTING FACTS, return those idx values in duplicate_facts.
-           - Facts with similar information that contain key differences should NOT be marked as duplicates.
+           - If the NEW FACT represents identical or semantically equivalent factual information as any fact in EXISTING FACTS, return those idx values in duplicate_facts.
+           - Facts expressing the same relationship with different wording (e.g., different languages, different phrasing) ARE duplicates.
+           - Facts with similar information that contain key differences (different values, different targets) should NOT be marked as duplicates.
            - Return idx values from EXISTING FACTS.
            - If no duplicates, return an empty list for duplicate_facts.
 
-        2. FACT TYPE CLASSIFICATION:
+        2. FACT MERGING (Required when duplicates found):
+           - When duplicate_facts is NOT empty, you MUST provide merged_fact.
+           - merged_fact should combine the semantic meaning of BOTH the NEW FACT and the EXISTING FACT(s).
+           - Create a concise, comprehensive description that captures all unique information without redundancy.
+           - If facts are in different languages, prefer the language with more detail or use a consistent language.
+           - If no duplicates, set merged_fact to null.
+
+        3. FACT TYPE CLASSIFICATION:
            - Given the predefined FACT TYPES, determine if the NEW FACT should be classified as one of these types.
            - **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each fact type description to ensure correct classification.
            - Return the fact type as fact_type or DEFAULT if NEW FACT is not one of the FACT TYPES.
@@ -147,7 +162,7 @@ def resolve_edge(context: dict[str, Any]) -> list[Message]:
              - Or why DEFAULT was chosen if no type matched (what was missing or wrong)
              - This forces careful consideration before classification.
 
-        3. CONTRADICTION DETECTION:
+        4. CONTRADICTION DETECTION:
            - Based on FACT INVALIDATION CANDIDATES and NEW FACT, determine which facts the new fact contradicts.
            - Return idx values from FACT INVALIDATION CANDIDATES.
            - If no contradictions, return an empty list for contradicted_facts.
@@ -156,10 +171,12 @@ def resolve_edge(context: dict[str, Any]) -> list[Message]:
         - duplicate_facts: Use ONLY 'idx' values from EXISTING FACTS
         - contradicted_facts: Use ONLY 'idx' values from FACT INVALIDATION CANDIDATES
         - These are two separate lists with independent idx ranges starting from 0
+        - merged_fact is REQUIRED when duplicate_facts is not empty
 
         Guidelines:
         1. Some facts may be very similar but will have key differences, particularly around numeric values in the facts.
             Do not mark these facts as duplicates.
+        2. Facts in different languages describing the same relationship ARE duplicates and should be merged.
 
         <FACT TYPES>
         {context['edge_types']}

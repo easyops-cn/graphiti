@@ -318,6 +318,18 @@ class OpenAIGenericClient(LLMClient):
             return parsed
         except openai.RateLimitError as e:
             raise RateLimitError from e
+        except openai.APIStatusError as e:
+            # Log full HTTP response details for debugging
+            logger.error(f'[LLM] API error: status_code={e.status_code}, message={e.message}')
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    response_text = e.response.text if hasattr(e.response, 'text') else str(e.response)
+                    logger.error(f'[LLM] Full response body: {response_text}')
+                except Exception:
+                    logger.error(f'[LLM] Could not read response body')
+            if hasattr(e, 'body') and e.body is not None:
+                logger.error(f'[LLM] Error body: {e.body}')
+            raise
         except Exception as e:
             logger.error(f'Error in generating LLM response: {e}')
             raise

@@ -74,6 +74,7 @@ from graphiti_core.utils.bulk_utils import (
     extract_nodes_and_edges_bulk,
     resolve_edge_pointers,
     retrieve_previous_episodes_bulk,
+    semantic_dedupe_nodes_bulk,
 )
 from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.community_operations import (
@@ -1022,6 +1023,13 @@ class Graphiti:
                     edge_types,
                     edge_type_map or edge_type_map_default,
                     episodes,
+                )
+
+                # EasyOps: LLM semantic deduplication after attributes are extracted
+                final_hydrated_nodes = await semantic_dedupe_nodes_bulk(
+                    self.clients,
+                    final_hydrated_nodes,
+                    entity_types,
                 )
 
                 # Resolved pointers for episodic edges

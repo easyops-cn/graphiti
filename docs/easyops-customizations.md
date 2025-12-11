@@ -8,10 +8,16 @@
 |------|---------|------|
 | `graphiti_core/models/edges/edge_db_queries.py` | 新增函数 | 支持动态边类型的 Cypher 查询 |
 | `graphiti_core/utils/bulk_utils.py` | 逻辑修改 | 按边类型分组保存 |
+| `graphiti_core/utils/bulk_utils.py` | 新增函数 | 批量去重第三轮 LLM 语义去重 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
 | `graphiti_core/prompts/extract_nodes.py` | 新增 | Knowledge Graph Builder's Principles + filter_entities |
 | `graphiti_core/utils/maintenance/node_operations.py` | 新增 | filter_extracted_nodes 函数 |
 | `graphiti_core/llm_client/openai_generic_client.py` | 新增 | small_model 支持 |
+| `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | 候选搜索按同实体类型过滤 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 候选搜索按同边类型过滤 |
+| `graphiti_core/search/search_config.py` | 参数修改 | DEFAULT_SEARCH_LIMIT 从 10 改为 20 |
+| `graphiti_core/prompts/dedupe_edges.py` | 新增字段 | EdgeDuplicate 添加 merged_fact 字段 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 边去重时合并 fact 和属性 |
 
 ---
 
@@ -306,6 +312,21 @@ ORDER BY cnt DESC
 
 **目的**: 让 LLM 输出推理过程，提高抽取准确性（Chain of Thought）。
 
+**修改的模型**:
+
+| 文件 | 模型 | 新增字段 |
+|-----|------|---------|
+| `extract_nodes.py` | `ExtractedEntity` | `reasoning: str` - 解释为什么抽取该实体及类型选择原因 |
+| `extract_nodes.py` | `EntitiesToFilter` | `reasoning: str` - 解释为什么过滤这些实体 |
+| `extract_edges.py` | `Edge` | `reasoning: str` - 解释为什么抽取该关系及类型选择原因 |
+| `dedupe_edges.py` | `EdgeDuplicate` | `fact_type_reasoning: str` - 解释边类型分类的原因 |
+
+**重要说明**:
+- reasoning 字段**不入库**，仅用于提高 LLM 输出质量
+- 实体抽取后转换为 `EntityNode` 时，reasoning 被丢弃
+- 边抽取后转换为 `EntityEdge` 时，reasoning 被丢弃
+- 这是合理的设计：reasoning 是过程信息，不是最终要存储的知识
+
 ### 3.2 FalkorDB 字符串转义
 
 **文件**: `graphiti_core/utils/bulk_utils.py`
@@ -421,3 +442,273 @@ OPENAI_SMALL_MODEL=qwen3-235a22b-2507-local_2
 ```
 
 如果不设置 `OPENAI_SMALL_MODEL`，系统会自动使用 `OPENAI_MODEL` 作为 fallback。
+
+---
+
+## 5. 批量去重 LLM 语义去重（Semantic Dedup）
+
+### 问题背景
+
+批量导入时（`add_episode_bulk`），同一批次内的实体去重存在问题：
+
+1. **确定性匹配局限**：精确字符串匹配和 MinHash Jaccard ≥ 0.9 无法处理语义同义词
+2. **中英文同义词**：如 `EasyITSM` vs `IT服务中心` vs `EasyITSC`（同一产品的不同名称）
+3. **Summary 时机问题**：原有的批量去重在 `extract_attributes_from_nodes` 之前执行，此时 summary 为空
+
+导致同一实体被创建为多个节点。
+
+### 解决方案
+
+**文件**:
+- `graphiti_core/utils/bulk_utils.py` - 新增函数
+- `graphiti_core/graphiti.py` - 调用入口
+
+在 `extract_attributes_from_nodes` 之后执行 LLM 语义去重，此时 summary 和 attributes 已填充。
+
+#### 5.1 新增辅助函数
+
+```python
+def _get_entity_type_label(node: EntityNode) -> str:
+    """获取实体的具体类型标签（非 'Entity'）"""
+
+async def _resolve_batch_with_llm(...) -> list[tuple[EntityNode, EntityNode]]:
+    """调用 LLM 识别语义重复，返回 (source, canonical) 节��对"""
+
+def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode) -> None:
+    """合并 source 的 summary 和 attributes 到 canonical"""
+```
+
+#### 5.2 新增主函数
+
+```python
+async def semantic_dedupe_nodes_bulk(
+    clients: GraphitiClients,
+    nodes: list[EntityNode],
+    entity_types: dict[str, type[BaseModel]] | None = None,
+) -> list[EntityNode]:
+    """
+    在 extract_attributes_from_nodes 之后执行 LLM 语义去重。
+    按实体类型分组，对同类型实体调用 LLM 检查是否为语义重复。
+    发现重复时合并 summary 和 attributes。
+    """
+```
+
+#### 5.3 调用位置
+
+```python
+# graphiti.py add_episode_bulk 中
+(final_hydrated_nodes, ...) = await self._resolve_nodes_and_edges_bulk(...)
+
+# EasyOps: 在 attributes 提取后执行语义去重
+final_hydrated_nodes = await semantic_dedupe_nodes_bulk(
+    self.clients, final_hydrated_nodes, entity_types
+)
+
+# 保存到图数据库
+await add_nodes_and_edges_bulk(...)
+```
+
+### 合并逻辑
+
+发现重复时，将 source 节点的信息合并到 canonical 节点：
+
+```python
+def _merge_node_into_canonical(source, canonical):
+    # Summary: 拼接（如果都有且不重复）
+    if source.summary and canonical.summary:
+        if source.summary not in canonical.summary:
+            canonical.summary = f"{canonical.summary} {source.summary}"
+    elif source.summary:
+        canonical.summary = source.summary
+
+    # Attributes: source 填充 canonical 缺失的字段
+    for key, value in source.attributes.items():
+        if key not in canonical.attributes or not canonical.attributes[key]:
+            canonical.attributes[key] = value
+```
+
+### 日志输出
+
+- `[semantic_dedup] Checking X ProductModule entities for semantic duplicates`
+- `[batch_dedup_llm] Sending 1 nodes to LLM against Y candidates`
+- `[batch_dedup_llm] Duplicate found: "EasyITSM" -> "IT服务中心"`
+- `[semantic_dedup] Merged "EasyITSM" into "IT服务中心"`
+
+### 效果
+
+- 批量导入时能正确识别语义同义词
+- 有 summary 信息帮助 LLM 判断
+- 合并重复实体的知识，不丢失信息
+
+---
+
+## 6. 同义词属性与搜索支持（待实现）
+
+### 需求背景
+
+实体去重合并后，被合并实体的名称（同义词）应该被保留，用于搜索时能通过同义词找到实体。
+
+**场景示例**：
+- 实体 `IT服务中心` 合并了 `EasyITSM` 后，`synonyms = ["EasyITSM"]`
+- 搜索 "EasyITSM" 时，能命中 `IT服务中心` 这个实体
+
+### 设计方案
+
+#### 6.1 数据存储
+
+在 `_merge_node_into_canonical()` 中，将被合并实体的名称记录到 `attributes.synonyms`：
+
+```python
+def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode):
+    # 现有合并逻辑...
+
+    # 记录同义词
+    synonyms = canonical.attributes.get('synonyms', [])
+    if source.name and source.name != canonical.name and source.name not in synonyms:
+        synonyms.append(source.name)
+    if synonyms:
+        canonical.attributes['synonyms'] = synonyms
+```
+
+#### 6.2 搜索增强：BM25 全文索引
+
+将 `synonyms` 加入 BM25 全文索引：
+
+**文件**: `graphiti_core/graph_queries.py`
+
+```python
+# 修改索引定义（第 121-122 行）
+"""CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS
+FOR (n:Entity) ON EACH [n.name, n.summary, n.synonyms, n.group_id]"""
+
+# Kuzu（第 113 行）
+"CALL CREATE_FTS_INDEX('Entity', 'node_name_and_summary', ['name', 'summary', 'synonyms']);"
+```
+
+**注意**：修改后需删除旧索引重建：
+```cypher
+DROP INDEX node_name_and_summary IF EXISTS;
+```
+
+#### 6.3 API 暴露
+
+**文件**: `src/elevo_memory/models/entity.py`
+
+```python
+class EntityNode(BaseModel):
+    synonyms: list[str] = Field(default_factory=list)  # 新增
+```
+
+**文件**: `src/elevo_memory/services/query_utils.py`
+
+```python
+def graphiti_node_to_entity(node):
+    return EntityNode(
+        synonyms=node.attributes.get('synonyms', []),
+        ...
+    )
+```
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/utils/bulk_utils.py` | `_merge_node_into_canonical()` 添加同义词记录 |
+| `graphiti_core/graph_queries.py` | BM25 索引加入 synonyms 字段 |
+| `src/elevo_memory/models/entity.py` | EntityNode 添加 synonyms 字段 |
+| `src/elevo_memory/services/query_utils.py` | 转换时提取 synonyms |
+
+---
+
+## 7. 边去重时合并 Fact（Edge Fact Merging）
+
+### 问题背景
+
+原始 Graphiti 的边去重逻辑存在问题：
+1. 当检测到重复边时，直接丢弃新边的 fact，只保留旧边的 fact
+2. 不同语言或不同表述的相同关系没有被识别为重复
+3. 重复边的属性（valid_at, invalid_at, attributes）没有合并
+
+### 解决方案
+
+#### 7.1 添加 merged_fact 字段
+
+**文件**: `graphiti_core/prompts/dedupe_edges.py`
+
+在 `EdgeDuplicate` 模型中添加 `merged_fact` 字段：
+
+```python
+class EdgeDuplicate(BaseModel):
+    duplicate_facts: list[int] = Field(...)
+    merged_fact: str | None = Field(
+        default=None,
+        description='When duplicate_facts is not empty, provide a merged fact that combines '
+        'the semantic meaning of both the NEW FACT and the EXISTING FACT(s)...',
+    )
+    contradicted_facts: list[int] = Field(...)
+    fact_type: str = Field(...)
+    fact_type_reasoning: str = Field(...)
+```
+
+#### 7.2 更新提示词
+
+**文件**: `graphiti_core/prompts/dedupe_edges.py`
+
+在 `resolve_edge` 提示词中增加：
+
+1. **重复检测增强**：明确"不同语言、不同措辞表达相同关系"也是重复
+2. **Fact 合并任务**：当检测到重复时，LLM 必须返回合并后的 fact
+3. **合并指南**：
+   - 合并两个 fact 的语义信息
+   - 去除冗余
+   - 如果是不同语言，选择更详细或更一致的语言
+
+#### 7.3 修改去重逻辑
+
+**文件**: `graphiti_core/utils/maintenance/edge_operations.py`
+
+修改 `resolve_extracted_edge` 函数中的去重逻辑：
+
+```python
+for duplicate_fact_id in duplicate_fact_ids:
+    existing_edge = related_edges[duplicate_fact_id]
+    # 使用 LLM 返回的合并 fact
+    merged_fact = response_object.merged_fact
+    if merged_fact and merged_fact.strip():
+        existing_edge.fact = merged_fact.strip()
+        existing_edge.fact_embedding = None  # 清除 embedding，后续重新计算
+        logger.info(f'[edge_dedup] Updated fact for edge {existing_edge.uuid} with LLM-merged content')
+    # 合并属性
+    for key, value in extracted_edge.attributes.items():
+        if key not in existing_edge.attributes:
+            existing_edge.attributes[key] = value
+    # 合并 valid_at：取较早的时间戳
+    if extracted_edge.valid_at and existing_edge.valid_at:
+        if extracted_edge.valid_at < existing_edge.valid_at:
+            existing_edge.valid_at = extracted_edge.valid_at
+    # 合并 invalid_at：取较晚的时间戳
+    if extracted_edge.invalid_at and existing_edge.invalid_at:
+        if extracted_edge.invalid_at > existing_edge.invalid_at:
+            existing_edge.invalid_at = extracted_edge.invalid_at
+    resolved_edge = existing_edge
+    break
+```
+
+### 合并策略
+
+| 字段 | 合并策略 |
+|-----|---------|
+| `fact` | LLM 合并，综合两个 fact 的语义信息 |
+| `fact_embedding` | 清空，由后续流程重新计算 |
+| `episodes` | 追加新 episode UUID（原有逻辑） |
+| `attributes` | 新边补充旧边缺失的字段 |
+| `valid_at` | 取较早的时间戳 |
+| `invalid_at` | 取较晚的时间戳 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/prompts/dedupe_edges.py` | `EdgeDuplicate` 添加 `merged_fact` 字段 |
+| `graphiti_core/prompts/dedupe_edges.py` | `resolve_edge` 提示词增加合并任务 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | `resolve_extracted_edge` 使用合并 fact |

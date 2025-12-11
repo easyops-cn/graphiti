@@ -320,6 +320,7 @@ async def resolve_extracted_edges(
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
 
     step_start = time()
+    # EasyOps customization: Filter by same edge type to improve deduplication accuracy
     edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -327,7 +328,9 @@ async def resolve_extracted_edges(
                 extracted_edge.fact,
                 group_ids=[extracted_edge.group_id],
                 config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(),
+                search_filter=SearchFilters(
+                    edge_types=[extracted_edge.name] if extracted_edge.name else None
+                ),
                 query_vector=fact_query_embeddings[i] if i < len(fact_query_embeddings) else None,
             )
             for i, extracted_edge in enumerate(extracted_edges)
@@ -590,7 +593,32 @@ async def resolve_extracted_edge(
 
     resolved_edge = extracted_edge
     for duplicate_fact_id in duplicate_fact_ids:
-        resolved_edge = related_edges[duplicate_fact_id]
+        existing_edge = related_edges[duplicate_fact_id]
+        # Use LLM-merged fact if available, otherwise keep existing fact
+        merged_fact = response_object.merged_fact
+        if merged_fact and merged_fact.strip():
+            existing_edge.fact = merged_fact.strip()
+            existing_edge.fact_embedding = None  # Clear embedding, will be recalculated
+            logger.info(
+                f'[edge_dedup] Updated fact for edge {existing_edge.uuid} with LLM-merged content'
+            )
+        # Merge attributes: fill missing fields from new edge
+        for key, value in extracted_edge.attributes.items():
+            if key not in existing_edge.attributes:
+                existing_edge.attributes[key] = value
+        # Merge valid_at: keep the earlier timestamp
+        if extracted_edge.valid_at and existing_edge.valid_at:
+            if extracted_edge.valid_at < existing_edge.valid_at:
+                existing_edge.valid_at = extracted_edge.valid_at
+        elif extracted_edge.valid_at and not existing_edge.valid_at:
+            existing_edge.valid_at = extracted_edge.valid_at
+        # Merge invalid_at: keep the later timestamp
+        if extracted_edge.invalid_at and existing_edge.invalid_at:
+            if extracted_edge.invalid_at > existing_edge.invalid_at:
+                existing_edge.invalid_at = extracted_edge.invalid_at
+        elif extracted_edge.invalid_at and not existing_edge.invalid_at:
+            existing_edge.invalid_at = extracted_edge.invalid_at
+        resolved_edge = existing_edge
         break
 
     if duplicate_fact_ids and episode is not None:

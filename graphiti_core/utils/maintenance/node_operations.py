@@ -278,7 +278,11 @@ async def _collect_candidate_nodes(
     extracted_nodes: list[EntityNode],
     existing_nodes_override: list[EntityNode] | None,
 ) -> list[EntityNode]:
-    """Search per extracted name and return unique candidates with overrides honored in order."""
+    """Search per extracted name and return unique candidates with overrides honored in order.
+
+    EasyOps customization: Filter candidates by same entity type to improve deduplication
+    accuracy for entities with different names but same semantic meaning (e.g., synonyms).
+    """
     perf_logger = logging.getLogger('graphiti.performance')
 
     # Pre-batch embeddings for all node names to avoid per-search embedding calls
@@ -291,13 +295,26 @@ async def _collect_candidate_nodes(
     perf_logger.info(f'[PERF]       └─ batch_search_embeddings: {(time() - step_start)*1000:.0f}ms, count={len(node_names)}')
 
     step_start = time()
+
+    def _get_specific_label(labels: list[str]) -> str | None:
+        """Get the most specific label (non-'Entity') from labels list."""
+        for label in labels:
+            if label != 'Entity':
+                return label
+        return None
+
     search_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
                 clients=clients,
                 query=node.name,
                 group_ids=[node.group_id],
-                search_filter=SearchFilters(),
+                # EasyOps: Filter by same entity type to find potential duplicates
+                search_filter=SearchFilters(
+                    node_labels=[_get_specific_label(node.labels)]
+                    if _get_specific_label(node.labels)
+                    else None
+                ),
                 config=NODE_HYBRID_SEARCH_RRF,
                 query_vector=query_embeddings[i] if i < len(query_embeddings) else None,
             )
