@@ -708,6 +708,7 @@ def graphiti_node_to_entity(node):
 1. 当检测到重复边时，直接丢弃新边的 fact，只保留旧边的 fact
 2. 不同语言或不同表述的相同关系没有被识别为重复
 3. 重复边的属性（valid_at, invalid_at, attributes）没有合并
+4. **关键问题**：同一对节点之间、同一边类型的边，即使 fact 描述不同，也会创建多条重复边
 
 ### 解决方案
 
@@ -743,42 +744,63 @@ class EdgeDuplicate(BaseModel):
    - 去除冗余
    - 如果是不同语言，选择更详细或更一致的语言
 
-#### 7.3 修改去重逻辑
+#### 7.3 强制合并同一对节点的边（2025-12-11 新增）
+
+**问题**：LLM 可能认为 "表单设计功能" 和 "表单库功能" 不是语义重复，返回 `duplicate_facts: []`。但如果这两条边连接的是同一对节点（source_uuid, target_uuid）且边类型相同，则应该强制合并，否则会产生重复边。
 
 **文件**: `graphiti_core/utils/maintenance/edge_operations.py`
 
-修改 `resolve_extracted_edge` 函数中的去重逻辑：
+在 `resolve_extracted_edge` 函数中添加强制合并逻辑：
+
+```python
+# 即使 LLM 不认为是重复，如果同一对节点间已有同类型边，也要强制合并
+if not duplicate_fact_ids and related_edges:
+    for i, edge in enumerate(related_edges):
+        if (
+            edge.source_node_uuid == extracted_edge.source_node_uuid
+            and edge.target_node_uuid == extracted_edge.target_node_uuid
+            and edge.name == extracted_edge.name  # 同一边类型
+        ):
+            duplicate_fact_ids = [i]
+            logger.info(
+                f'[edge_dedup] Force merge: same node pair and edge type ({edge.name}), '
+                f'merging "{extracted_edge.fact[:50]}..." into existing edge {edge.uuid}'
+            )
+            break
+```
+
+#### 7.4 修改合并逻辑
+
+**文件**: `graphiti_core/utils/maintenance/edge_operations.py`
+
+修改 `resolve_extracted_edge` 函数中的合并逻辑，支持两种情况：
 
 ```python
 for duplicate_fact_id in duplicate_fact_ids:
     existing_edge = related_edges[duplicate_fact_id]
-    # 使用 LLM 返回的合并 fact
     merged_fact = response_object.merged_fact
     if merged_fact and merged_fact.strip():
+        # 使用 LLM 返回的合并 fact
         existing_edge.fact = merged_fact.strip()
-        existing_edge.fact_embedding = None  # 清除 embedding，后续重新计算
+        existing_edge.fact_embedding = None
         logger.info(f'[edge_dedup] Updated fact for edge {existing_edge.uuid} with LLM-merged content')
-    # 合并属性
-    for key, value in extracted_edge.attributes.items():
-        if key not in existing_edge.attributes:
-            existing_edge.attributes[key] = value
-    # 合并 valid_at：取较早的时间戳
-    if extracted_edge.valid_at and existing_edge.valid_at:
-        if extracted_edge.valid_at < existing_edge.valid_at:
-            existing_edge.valid_at = extracted_edge.valid_at
-    # 合并 invalid_at：取较晚的时间戳
-    if extracted_edge.invalid_at and existing_edge.invalid_at:
-        if extracted_edge.invalid_at > existing_edge.invalid_at:
-            existing_edge.invalid_at = extracted_edge.invalid_at
-    resolved_edge = existing_edge
-    break
+    else:
+        # 强制合并场景：LLM 没有返回 merged_fact，手动拼接
+        new_fact = extracted_edge.fact.strip()
+        existing_fact = existing_edge.fact.strip()
+        if new_fact and new_fact not in existing_fact and existing_fact not in new_fact:
+            existing_edge.fact = f'{existing_fact} {new_fact}'
+            existing_edge.fact_embedding = None
+            logger.info(f'[edge_dedup] Concatenated fact for edge {existing_edge.uuid}')
+    # 合并属性、valid_at、invalid_at（同原逻辑）
+    ...
 ```
 
 ### 合并策略
 
 | 字段 | 合并策略 |
 |-----|---------|
-| `fact` | LLM 合并，综合两个 fact 的语义信息 |
+| `fact` | 优先使用 LLM 合并结果；如无则拼接（去重后） |
 | `fact_embedding` | 清空，由后续流程重新计算 |
 | `episodes` | 追加新 episode UUID（原有逻辑） |
 | `attributes` | 新边补充旧边缺失的字段 |
@@ -791,4 +813,6 @@ for duplicate_fact_id in duplicate_fact_ids:
 |-----|---------|
 | `graphiti_core/prompts/dedupe_edges.py` | `EdgeDuplicate` 添加 `merged_fact` 字段 |
 | `graphiti_core/prompts/dedupe_edges.py` | `resolve_edge` 提示词增加合并任务 |
-| `graphiti_core/utils/maintenance/edge_operations.py` | `resolve_extracted_edge` 使用合并 fact |
+| `graphiti_core/utils/maintenance/edge_operations.py` | `resolve_extracted_edge` 强制合并同一对节点的边 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | `resolve_extracted_edge` 支持拼接 fact（无 LLM 合并时） |
+

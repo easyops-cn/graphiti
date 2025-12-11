@@ -591,10 +591,27 @@ async def resolve_extracted_edge(
 
     duplicate_fact_ids: list[int] = [i for i in duplicate_facts if 0 <= i < len(related_edges)]
 
+    # EasyOps customization: Force merge when same edge type exists between same node pair
+    # Even if LLM doesn't detect semantic duplicates, we should merge facts for edges
+    # with identical (source_uuid, target_uuid, edge_type) to avoid redundant edges.
+    if not duplicate_fact_ids and related_edges:
+        for i, edge in enumerate(related_edges):
+            if (
+                edge.source_node_uuid == extracted_edge.source_node_uuid
+                and edge.target_node_uuid == extracted_edge.target_node_uuid
+                and edge.name == extracted_edge.name  # Same edge type
+            ):
+                duplicate_fact_ids = [i]
+                logger.info(
+                    f'[edge_dedup] Force merge: same node pair and edge type ({edge.name}), '
+                    f'merging "{extracted_edge.fact[:50]}..." into existing edge {edge.uuid}'
+                )
+                break
+
     resolved_edge = extracted_edge
     for duplicate_fact_id in duplicate_fact_ids:
         existing_edge = related_edges[duplicate_fact_id]
-        # Use LLM-merged fact if available, otherwise keep existing fact
+        # Use LLM-merged fact if available, otherwise concatenate facts
         merged_fact = response_object.merged_fact
         if merged_fact and merged_fact.strip():
             existing_edge.fact = merged_fact.strip()
@@ -602,6 +619,16 @@ async def resolve_extracted_edge(
             logger.info(
                 f'[edge_dedup] Updated fact for edge {existing_edge.uuid} with LLM-merged content'
             )
+        else:
+            # No LLM merged_fact available (e.g., force merge case), concatenate facts
+            new_fact = extracted_edge.fact.strip()
+            existing_fact = existing_edge.fact.strip()
+            if new_fact and new_fact not in existing_fact and existing_fact not in new_fact:
+                existing_edge.fact = f'{existing_fact} {new_fact}'
+                existing_edge.fact_embedding = None  # Clear embedding, will be recalculated
+                logger.info(
+                    f'[edge_dedup] Concatenated fact for edge {existing_edge.uuid}'
+                )
         # Merge attributes: fill missing fields from new edge
         for key, value in extracted_edge.attributes.items():
             if key not in existing_edge.attributes:
