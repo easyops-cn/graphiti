@@ -192,6 +192,14 @@ def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode) -> Non
         if key not in canonical.attributes or not canonical.attributes[key]:
             canonical.attributes[key] = value
 
+    # EasyOps: Record synonyms (space-separated string for BM25 full-text index)
+    if source.name and source.name != canonical.name:
+        existing_synonyms = canonical.attributes.get('synonyms', '')
+        synonym_list = existing_synonyms.split() if existing_synonyms else []
+        if source.name not in synonym_list:
+            synonym_list.append(source.name)
+            canonical.attributes['synonyms'] = ' '.join(synonym_list)
+
 
 async def semantic_dedupe_nodes_bulk(
     clients: GraphitiClients,
@@ -423,9 +431,11 @@ async def add_nodes_and_edges_bulk_tx(
         # Sanitize string fields for FalkorDB
         name = node.name
         summary = node.summary
+        reasoning = node.reasoning
         if driver.provider == GraphProvider.FALKORDB:
             name = _sanitize_string_for_falkordb(name) if name else name
             summary = _sanitize_string_for_falkordb(summary) if summary else summary
+            reasoning = _sanitize_string_for_falkordb(reasoning) if reasoning else reasoning
 
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
@@ -435,6 +445,7 @@ async def add_nodes_and_edges_bulk_tx(
             'created_at': node.created_at,
             'name_embedding': node.name_embedding,
             'labels': list(set(node.labels + ['Entity'])),
+            'reasoning': reasoning,
         }
 
         if driver.provider == GraphProvider.KUZU:

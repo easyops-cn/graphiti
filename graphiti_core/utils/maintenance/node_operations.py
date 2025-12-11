@@ -258,12 +258,18 @@ async def extract_nodes(
 
         labels: list[str] = list({'Entity', str(entity_type_name)})
 
+        # Get reasoning for debugging/analysis
+        reasoning = None
+        if hasattr(extracted_entity, 'reasoning') and extracted_entity.reasoning:
+            reasoning = extracted_entity.reasoning
+
         new_node = EntityNode(
             name=extracted_entity.name,
             group_id=episode.group_id,
             labels=labels,
             summary='',
             created_at=utc_now(),
+            reasoning=reasoning,
         )
         extracted_nodes.append(new_node)
         logger.debug(f'Created new node: {new_node.name} (UUID: {new_node.uuid})')

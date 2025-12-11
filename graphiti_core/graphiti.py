@@ -782,10 +782,20 @@ class Graphiti:
                     group_id,
                     edge_types,
                 )
-                (nodes, uuid_map, _), extracted_edges = await semaphore_gather(
+                (nodes, uuid_map, duplicate_pairs), extracted_edges = await semaphore_gather(
                     resolve_task, extract_edges_task
                 )
                 perf_logger.info(f'[PERF] resolve_nodes + extract_edges (parallel): {(time() - step_start)*1000:.0f}ms, nodes={len(nodes)}, edges={len(extracted_edges)}')
+
+                # EasyOps: Record synonyms from duplicate_pairs to canonical nodes
+                for source_node, canonical_node in duplicate_pairs:
+                    if source_node.name and source_node.name != canonical_node.name:
+                        existing_synonyms = canonical_node.attributes.get('synonyms', '')
+                        synonym_list = existing_synonyms.split() if existing_synonyms else []
+                        if source_node.name not in synonym_list:
+                            synonym_list.append(source_node.name)
+                            canonical_node.attributes['synonyms'] = ' '.join(synonym_list)
+                            logger.info(f'[synonym] Recorded synonym "{source_node.name}" for entity "{canonical_node.name}"')
 
                 # Resolve edge pointers
                 step_start = time()

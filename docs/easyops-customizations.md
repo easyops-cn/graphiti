@@ -9,6 +9,9 @@
 | `graphiti_core/models/edges/edge_db_queries.py` | 新增函数 | 支持动态边类型的 Cypher 查询 |
 | `graphiti_core/utils/bulk_utils.py` | 逻辑修改 | 按边类型分组保存 |
 | `graphiti_core/utils/bulk_utils.py` | 新增函数 | 批量去重第三轮 LLM 语义去重 |
+| `graphiti_core/utils/bulk_utils.py` | 逻辑修改 | `_merge_node_into_canonical()` 记录同义词 |
+| `graphiti_core/graphiti.py` | 逻辑修改 | `add_episode()` 记录 duplicate_pairs 同义词 |
+| `graphiti_core/graph_queries.py` | 参数修改 | BM25 索引添加 synonyms 字段 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
 | `graphiti_core/prompts/extract_nodes.py` | 新增 | Knowledge Graph Builder's Principles + filter_entities |
 | `graphiti_core/utils/maintenance/node_operations.py` | 新增 | filter_extracted_nodes 函数 |
@@ -542,79 +545,132 @@ def _merge_node_into_canonical(source, canonical):
 
 ---
 
-## 6. 同义词属性与搜索支持（待实现）
+## 6. 同义词属性与搜索支持（已实现）
 
 ### 需求背景
 
 实体去重合并后，被合并实体的名称（同义词）应该被保留，用于搜索时能通过同义词找到实体。
 
 **场景示例**：
-- 实体 `IT服务中心` 合并了 `EasyITSM` 后，`synonyms = ["EasyITSM"]`
+- 实体 `IT服务中心` 合并了 `EasyITSM` 后，`synonyms = "EasyITSM"`
 - 搜索 "EasyITSM" 时，能命中 `IT服务中心` 这个实体
 
-### 设计方案
+### 实现方案
 
-#### 6.1 数据存储
+#### 6.1 数据存储（空格分隔字符串）
 
-在 `_merge_node_into_canonical()` 中，将被合并实体的名称记录到 `attributes.synonyms`：
+同义词存储为**空格分隔的字符串**（而非数组），以便 BM25 全文索引直接支持。
+
+**文件**: `graphiti_core/utils/bulk_utils.py`
+
+在 `_merge_node_into_canonical()` 中添加同义词记录：
 
 ```python
 def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode):
     # 现有合并逻辑...
 
-    # 记录同义词
-    synonyms = canonical.attributes.get('synonyms', [])
-    if source.name and source.name != canonical.name and source.name not in synonyms:
-        synonyms.append(source.name)
-    if synonyms:
-        canonical.attributes['synonyms'] = synonyms
+    # EasyOps: Record synonyms (space-separated string for BM25 full-text index)
+    if source.name and source.name != canonical.name:
+        existing_synonyms = canonical.attributes.get('synonyms', '')
+        synonym_list = existing_synonyms.split() if existing_synonyms else []
+        if source.name not in synonym_list:
+            synonym_list.append(source.name)
+            canonical.attributes['synonyms'] = ' '.join(synonym_list)
 ```
 
-#### 6.2 搜索增强：BM25 全文索引
+#### 6.2 单条写入时记录同义词
+
+**文件**: `graphiti_core/graphiti.py`
+
+在 `add_episode()` 方法中，`resolve_extracted_nodes()` 返回的 `duplicate_pairs` 包含检测到的重复实体对。
+修改代码以记录这些同义词：
+
+```python
+(nodes, uuid_map, duplicate_pairs), extracted_edges = await semaphore_gather(
+    resolve_task, extract_edges_task
+)
+
+# EasyOps: Record synonyms from duplicate_pairs to canonical nodes
+for source_node, canonical_node in duplicate_pairs:
+    if source_node.name and source_node.name != canonical_node.name:
+        existing_synonyms = canonical_node.attributes.get('synonyms', '')
+        synonym_list = existing_synonyms.split() if existing_synonyms else []
+        if source_node.name not in synonym_list:
+            synonym_list.append(source_node.name)
+            canonical_node.attributes['synonyms'] = ' '.join(synonym_list)
+            logger.info(f'[synonym] Recorded synonym "{source_node.name}" for entity "{canonical_node.name}"')
+```
+
+#### 6.3 搜索增强：BM25 全文索引
 
 将 `synonyms` 加入 BM25 全文索引：
 
 **文件**: `graphiti_core/graph_queries.py`
 
+**Neo4j**（第 121-122 行）:
 ```python
-# 修改索引定义（第 121-122 行）
 """CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS
 FOR (n:Entity) ON EACH [n.name, n.summary, n.synonyms, n.group_id]"""
+```
 
-# Kuzu（第 113 行）
+**FalkorDB**（第 92-98 行）:
+```python
+f"""CALL db.idx.fulltext.createNodeIndex(
+    {{ label: 'Entity', stopwords: {stopwords_str} }},
+    'name', 'summary', 'synonyms', 'group_id'
+)"""
+```
+
+**Kuzu**（第 113 行）:
+```python
 "CALL CREATE_FTS_INDEX('Entity', 'node_name_and_summary', ['name', 'summary', 'synonyms']);"
 ```
 
-**注意**：修改后需删除旧索引重建：
+**注意**：升级后需删除旧索引重建：
 ```cypher
-DROP INDEX node_name_and_summary IF EXISTS;
+-- FalkorDB
+CALL db.idx.fulltext.drop('Entity')
+-- 然后重启服务，索引会自动创建
 ```
 
-#### 6.3 API 暴露
+#### 6.4 API 暴露
 
 **文件**: `src/elevo_memory/models/entity.py`
 
 ```python
 class EntityNode(BaseModel):
-    synonyms: list[str] = Field(default_factory=list)  # 新增
+    synonyms: list[str] = Field(default_factory=list, description="实体同义词列表")
 ```
 
 **文件**: `src/elevo_memory/services/query_utils.py`
 
 ```python
 def graphiti_node_to_entity(node):
+    # 提取同义词（空格分隔字符串 -> 列表）
+    synonyms_str = node.attributes.get('synonyms', '') if node.attributes else ''
+    synonyms = synonyms_str.split() if synonyms_str else []
+
     return EntityNode(
-        synonyms=node.attributes.get('synonyms', []),
+        synonyms=synonyms,
         ...
     )
 ```
+
+### 触发范围
+
+| API | 会记录同义词? |
+|-----|--------------|
+| `add_episode_bulk()` 批量 | ✅ 会（通过 `semantic_dedupe_nodes_bulk`） |
+| `add_episode()` 单条 | ✅ 会（通过 `duplicate_pairs`） |
+| `triplet` API | ❌ 不会（直接写入，不经过去重） |
 
 ### 修改文件清单
 
 | 文件 | 修改内容 |
 |-----|---------|
 | `graphiti_core/utils/bulk_utils.py` | `_merge_node_into_canonical()` 添加同义词记录 |
-| `graphiti_core/graph_queries.py` | BM25 索引加入 synonyms 字段 |
+| `graphiti_core/graphiti.py` | `add_episode()` 中记录 `duplicate_pairs` 的同义词 |
+| `graphiti_core/graph_queries.py` | BM25 索引加入 synonyms 字段（3 个数据库） |
 | `src/elevo_memory/models/entity.py` | EntityNode 添加 synonyms 字段 |
 | `src/elevo_memory/services/query_utils.py` | 转换时提取 synonyms |
 

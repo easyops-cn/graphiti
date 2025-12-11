@@ -438,6 +438,10 @@ class EntityNode(Node):
     attributes: dict[str, Any] = Field(
         default={}, description='Additional attributes of the node. Dependent on node labels'
     )
+    reasoning: str | None = Field(
+        default=None,
+        description='LLM reasoning for entity extraction and type classification (Chain of Thought)'
+    )
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
@@ -485,6 +489,7 @@ class EntityNode(Node):
             'group_id': self.group_id,
             'summary': self.summary,
             'created_at': self.created_at,
+            'reasoning': self.reasoning,
         }
 
         if driver.provider == GraphProvider.KUZU:
@@ -763,6 +768,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         attributes.pop('summary', None)
         attributes.pop('created_at', None)
         attributes.pop('labels', None)
+        attributes.pop('reasoning', None)  # reasoning is a separate field, not in attributes
 
     labels = record.get('labels', [])
     group_id = record.get('group_id')
@@ -778,6 +784,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         created_at=parse_db_date(record['created_at']),  # type: ignore
         summary=record['summary'],
         attributes=attributes,
+        reasoning=record.get('reasoning'),
     )
 
     return entity_node
