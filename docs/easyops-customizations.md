@@ -306,14 +306,17 @@ ORDER BY cnt DESC
 
 ## 3. 其他自定义修改
 
-### 3.1 LLM Prompt 增加 reasoning 字段
+### 3.1 LLM Prompt 增加 reasoning 字段（实体抽取入库）
 
 **文件**:
 - `graphiti_core/prompts/extract_nodes.py`
 - `graphiti_core/prompts/extract_edges.py`
 - `graphiti_core/prompts/dedupe_edges.py`
+- `graphiti_core/nodes.py` - EntityNode 模型增加 reasoning 字段
+- `graphiti_core/utils/maintenance/node_operations.py` - 提取 reasoning 并保存
+- `graphiti_core/utils/bulk_utils.py` - 批量保存包含 reasoning
 
-**目的**: 让 LLM 输出推理过程，提高抽取准确性（Chain of Thought）。
+**目的**: 让 LLM 输出推理过程，提高抽取准确性（Chain of Thought），并将实体的 reasoning 入库供后续分析和调试。
 
 **修改的模型**:
 
@@ -323,12 +326,18 @@ ORDER BY cnt DESC
 | `extract_nodes.py` | `EntitiesToFilter` | `reasoning: str` - 解释为什么过滤这些实体 |
 | `extract_edges.py` | `Edge` | `reasoning: str` - 解释为什么抽取该关系及类型选择原因 |
 | `dedupe_edges.py` | `EdgeDuplicate` | `fact_type_reasoning: str` - 解释边类型分类的原因 |
+| `nodes.py` | `EntityNode` | `reasoning: str \| None` - LLM 的分类推理过程 |
 
-**重要说明**:
-- reasoning 字段**不入库**，仅用于提高 LLM 输出质量
-- 实体抽取后转换为 `EntityNode` 时，reasoning 被丢弃
-- 边抽取后转换为 `EntityEdge` 时，reasoning 被丢弃
-- 这是合理的设计：reasoning 是过程信息，不是最终要存储的知识
+**实体 reasoning 入库说明**:
+- 实体的 reasoning 字段会持久化到图数据库的节点属性中
+- 查询实体时从 `properties(n)` 中提取 reasoning 并返回给前端
+- 边的 reasoning 不入库，仅用于提高 LLM 输出质量
+
+**关键修改点**:
+1. `EntityNode` 模型新增 `reasoning: str | None` 字段
+2. `extract_nodes()` 函数在创建新节点时传递 reasoning
+3. `add_nodes_and_edges_bulk_tx()` 在保存时包含 reasoning
+4. `get_entity_node_from_record()` 从 attributes 中提取 reasoning（因为使用 `properties(n) AS attributes` 返回所有节点属性）
 
 ### 3.2 FalkorDB 字符串转义
 
@@ -543,6 +552,14 @@ def _merge_node_into_canonical(source, canonical):
 - 有 summary 信息帮助 LLM 判断
 - 合并重复实体的知识，不丢失信息
 
+### 合并逻辑（_merge_node_into_canonical）
+
+合并时会合并以下字段：
+- **summary**: 拼接（如果都有且不重复）
+- **attributes**: source 填充 canonical 缺失的字段
+- **reasoning**: 拼接（用 `\n---\n` 分隔，保留所有推理过程）
+- **synonyms**: 记录被合并实体的名称
+
 ---
 
 ## 6. 同义词属性与搜索支持（已实现）
@@ -563,11 +580,18 @@ def _merge_node_into_canonical(source, canonical):
 
 **文件**: `graphiti_core/utils/bulk_utils.py`
 
-在 `_merge_node_into_canonical()` 中添加同义词记录：
+在 `_merge_node_into_canonical()` 中添加同义词和 reasoning 合并：
 
 ```python
 def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode):
-    # 现有合并逻辑...
+    # 现有合并逻辑（summary, attributes）...
+
+    # EasyOps: Merge reasoning - prefer non-empty, concatenate if both exist
+    if source.reasoning and canonical.reasoning:
+        if source.reasoning not in canonical.reasoning:
+            canonical.reasoning = f"{canonical.reasoning}\n---\n{source.reasoning}"
+    elif source.reasoning and not canonical.reasoning:
+        canonical.reasoning = source.reasoning
 
     # EasyOps: Record synonyms (space-separated string for BM25 full-text index)
     if source.name and source.name != canonical.name:

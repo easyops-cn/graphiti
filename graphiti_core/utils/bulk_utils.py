@@ -192,6 +192,13 @@ def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode) -> Non
         if key not in canonical.attributes or not canonical.attributes[key]:
             canonical.attributes[key] = value
 
+    # EasyOps: Merge reasoning - prefer non-empty, concatenate if both exist
+    if source.reasoning and canonical.reasoning:
+        if source.reasoning not in canonical.reasoning:
+            canonical.reasoning = f"{canonical.reasoning}\n---\n{source.reasoning}"
+    elif source.reasoning and not canonical.reasoning:
+        canonical.reasoning = source.reasoning
+
     # EasyOps: Record synonyms (space-separated string for BM25 full-text index)
     if source.name and source.name != canonical.name:
         existing_synonyms = canonical.attributes.get('synonyms', '')

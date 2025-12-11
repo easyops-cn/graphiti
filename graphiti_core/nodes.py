@@ -768,7 +768,9 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         attributes.pop('summary', None)
         attributes.pop('created_at', None)
         attributes.pop('labels', None)
-        attributes.pop('reasoning', None)  # reasoning is a separate field, not in attributes
+
+    # Extract reasoning from attributes before removing it
+    reasoning = attributes.pop('reasoning', None)
 
     labels = record.get('labels', [])
     group_id = record.get('group_id')
@@ -784,7 +786,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         created_at=parse_db_date(record['created_at']),  # type: ignore
         summary=record['summary'],
         attributes=attributes,
-        reasoning=record.get('reasoning'),
+        reasoning=reasoning,
     )
 
     return entity_node
