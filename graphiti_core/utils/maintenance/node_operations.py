@@ -91,6 +91,7 @@ async def filter_extracted_nodes(
     episode: EpisodicNode,
     extracted_entities: list[ExtractedEntity],
     group_id: str | None = None,
+    entity_types_context: list[dict] | None = None,
 ) -> list[str]:
     """Filter out entities that don't meet knowledge graph quality standards.
 
@@ -99,6 +100,8 @@ async def filter_extracted_nodes(
     - Entities that can't connect meaningfully (Connectivity)
     - Entities that aren't self-explanatory (Independence)
     - Document artifacts instead of domain knowledge (Domain Value)
+
+    If entity_types_context is provided, entities matching valid types will be preserved.
     """
     if not extracted_entities:
         return []
@@ -106,6 +109,7 @@ async def filter_extracted_nodes(
     context = {
         'episode_content': episode.content,
         'extracted_entities': [e.name for e in extracted_entities],
+        'entity_types': entity_types_context,
     }
 
     llm_response = await llm_client.generate_response(
@@ -228,6 +232,7 @@ async def extract_nodes(
         episode,
         extracted_entities,
         episode.group_id,
+        entity_types_context,
     )
     llm_call_count += 1
     perf_logger.info(f'[PERF]     └─ extract_nodes filter #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')

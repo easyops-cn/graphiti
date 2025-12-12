@@ -44,7 +44,11 @@ Before extracting any entity, verify it passes ALL four principles:
 4. **Domain Value Principle**: Only extract entities that represent real domain knowledge, not document artifacts.
    Ask: "Is this a concept a domain expert would recognize and care about?"
 
-**EXTRACTION DECISION**: If uncertain about any principle, do NOT extract. It is better to miss an entity than to pollute the knowledge graph with noise.
+**EXTRACTION DECISION**: Apply a HIGH BAR for extraction.
+- When uncertain about ANY principle, do NOT extract.
+- Prefer PRECISION over RECALL - a smaller, high-quality knowledge graph is far more valuable than a large, noisy one.
+- If an entity only makes sense within the context of a specific process, workflow, or document structure, it likely fails the Independence Principle.
+- Generic terms, internal process steps, and transient concepts should NOT be extracted.
 """
 
 
@@ -297,7 +301,18 @@ Review each extracted entity against the Knowledge Graph Builder's Principles:
 3. **Independence Principle**: Is the name self-explanatory without the source text?
 4. **Domain Value Principle**: Does it represent real domain knowledge, not document artifacts?
 
-An entity should be REMOVED if it fails ANY of these principles."""
+An entity should be REMOVED if it fails ANY of these principles.
+
+**IMPORTANT**: Before removing an entity, check if it matches any of the VALID ENTITY TYPES defined in the schema. If an entity clearly belongs to a defined type (based on the type's description and examples), it should be KEPT even if it seems document-specific."""
+
+    # Build entity types reference if available
+    entity_types_ref = ''
+    if context.get('entity_types'):
+        entity_types_ref = '\n<VALID ENTITY TYPES>\n'
+        for et in context['entity_types']:
+            if et.get('entity_type_name') != 'Entity':  # Skip default type
+                entity_types_ref += f"- {et.get('entity_type_name')}: {et.get('entity_type_description', '')}\n"
+        entity_types_ref += '</VALID ENTITY TYPES>\n'
 
     user_prompt = f"""
 <EXTRACTED ENTITIES>
@@ -307,15 +322,19 @@ An entity should be REMOVED if it fails ANY of these principles."""
 <SOURCE TEXT>
 {context['episode_content']}
 </SOURCE TEXT>
+{entity_types_ref}
+Review each extracted entity. Return the names of entities that FAIL the Knowledge Graph Builder's Principles.
 
-Review each extracted entity. Return the names of entities that FAIL any Knowledge Graph Builder's Principle.
+**Decision Process**:
+1. First, check if the entity matches any VALID ENTITY TYPE (if provided). If it clearly fits a defined type based on the type's description and examples, KEEP it.
+2. Only if the entity doesn't match any valid type, apply the four principles strictly.
 
 These entities should typically be removed:
 - Variables, function names, or IDs that only make sense within code examples
 - Placeholder values or template markers (e.g., $1, fwjfl7towi)
-- Generic process terms without specific domain meaning
+- Generic process terms without specific domain meaning (unless they match a valid entity type)
 - Technical artifacts of document formatting
-- Concepts that require the source document to understand
+- Concepts that require the source document to understand (unless they match a valid entity type)
 
 Return an empty list if all entities pass the quality check.
 """
