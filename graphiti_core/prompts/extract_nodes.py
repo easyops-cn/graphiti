@@ -314,16 +314,22 @@ An entity should be REMOVED if it fails ANY of these principles.
                 entity_types_ref += f"- {et.get('entity_type_name')}: {et.get('entity_type_description', '')}\n"
         entity_types_ref += '</VALID ENTITY TYPES>\n'
 
+    # Format entities - now includes summary and type if available
+    entities_json = to_prompt_json(context['extracted_entities'])
+
     user_prompt = f"""
 <EXTRACTED ENTITIES>
-{context['extracted_entities']}
+{entities_json}
 </EXTRACTED ENTITIES>
 
 <SOURCE TEXT>
 {context['episode_content']}
 </SOURCE TEXT>
 {entity_types_ref}
-Review each extracted entity. Return the names of entities that FAIL the Knowledge Graph Builder's Principles.
+Review each extracted entity. The entity info includes name, and may include summary and type.
+Use the summary to better understand what the entity represents.
+
+Return the **names** of entities that FAIL the Knowledge Graph Builder's Principles.
 
 **Decision Process**:
 1. First, check if the entity matches any VALID ENTITY TYPE (if provided). If it clearly fits a defined type based on the type's description and examples, KEEP it.

@@ -89,7 +89,7 @@ async def extract_nodes_reflexion(
 async def filter_extracted_nodes(
     llm_client: LLMClient,
     episode: EpisodicNode,
-    extracted_entities: list[ExtractedEntity],
+    nodes: list[EntityNode],
     group_id: str | None = None,
     entity_types_context: list[dict] | None = None,
 ) -> list[str]:
@@ -102,13 +102,35 @@ async def filter_extracted_nodes(
     - Document artifacts instead of domain knowledge (Domain Value)
 
     If entity_types_context is provided, entities matching valid types will be preserved.
+
+    Args:
+        llm_client: LLM client for generating responses
+        episode: The source episode
+        nodes: List of EntityNode objects (with summary if available)
+        group_id: Optional group ID
+        entity_types_context: Optional list of entity type definitions from schema
+
+    Returns:
+        List of entity names that should be removed
     """
-    if not extracted_entities:
+    if not nodes:
         return []
+
+    # Build entity info with summary for better filtering decisions
+    entities_info = []
+    for node in nodes:
+        info = {'name': node.name}
+        if node.summary:
+            info['summary'] = node.summary
+        # Include entity type for context
+        specific_type = next((l for l in node.labels if l != 'Entity'), None)
+        if specific_type:
+            info['type'] = specific_type
+        entities_info.append(info)
 
     context = {
         'episode_content': episode.content,
-        'extracted_entities': [e.name for e in extracted_entities],
+        'extracted_entities': entities_info,
         'entity_types': entity_types_context,
     }
 
@@ -224,22 +246,6 @@ async def extract_nodes(
             custom_prompt = 'Make sure that the following entities are extracted: '
             for entity in missing_entities:
                 custom_prompt += f'\n{entity},'
-
-    # Filter entities using Knowledge Graph Builder's Principles
-    llm_start = time()
-    entities_to_remove = await filter_extracted_nodes(
-        llm_client,
-        episode,
-        extracted_entities,
-        episode.group_id,
-        entity_types_context,
-    )
-    llm_call_count += 1
-    perf_logger.info(f'[PERF]     └─ extract_nodes filter #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
-
-    # Remove filtered entities
-    entities_to_remove_set = set(entities_to_remove)
-    extracted_entities = [e for e in extracted_entities if e.name not in entities_to_remove_set]
 
     filtered_extracted_entities = [entity for entity in extracted_entities if entity.name.strip()]
     end = time()

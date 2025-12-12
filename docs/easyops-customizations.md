@@ -12,7 +12,8 @@
 | `graphiti_core/utils/bulk_utils.py` | 新增函数 | 批量去重第三轮 LLM 语义去重 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
 | `graphiti_core/prompts/extract_nodes.py` | 新增 | Knowledge Graph Builder's Principles + filter_entities |
-| `graphiti_core/utils/maintenance/node_operations.py` | 新增 | filter_extracted_nodes 函数 |
+| `graphiti_core/utils/maintenance/node_operations.py` | 新增 | filter_extracted_nodes 函数（接收 EntityNode 含 summary） |
+| `graphiti_core/graphiti.py` | 逻辑修改 | **Filter 步骤移到 extract_attributes 之后（获取 summary 后再过滤）** |
 | `graphiti_core/llm_client/openai_generic_client.py` | 新增 | small_model 支持 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | 候选搜索按同实体类型过滤 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 候选搜索按同边类型过滤 |
@@ -24,7 +25,7 @@
 | `graphiti_core/prompts/dedupe_nodes.py` | Prompt优化 | 实体去重要求输出 reasoning，entity_type_definitions 独立 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | `_resolve_with_llm()` 独立提取类型定义，添加 reasoning 日志 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 容错处理 | **属性抽取枚举验证容错，移除无效字段而非崩溃** |
-| `graphiti_core/prompts/extract_nodes.py` | Prompt优化 | **filter_entities 增加 Schema 实体类型上下文** |
+| `graphiti_core/prompts/extract_nodes.py` | Prompt优化 | **filter_entities 增加 Schema 实体类型上下文 + summary** |
 | `graphiti_core/utils/maintenance/node_operations.py` | 参数传递 | filter_extracted_nodes 传入 entity_types_context |
 
 ---
@@ -119,8 +120,9 @@ class EntitiesToFilter(BaseModel):
 async def filter_extracted_nodes(
     llm_client: LLMClient,
     episode: EpisodicNode,
-    extracted_entities: list[ExtractedEntity],
+    nodes: list[EntityNode],  # 接收 EntityNode（已有 summary）
     group_id: str | None = None,
+    entity_types_context: list[dict] | None = None,
 ) -> list[str]:
     """Filter out entities that don't meet knowledge graph quality standards.
 
@@ -129,39 +131,86 @@ async def filter_extracted_nodes(
     - Entities that can't connect meaningfully (Connectivity)
     - Entities that aren't self-explanatory (Independence)
     - Document artifacts instead of domain knowledge (Domain Value)
+
+    If entity_types_context is provided, entities matching valid types will be preserved.
     """
-    # ... implementation ...
+    # Build entity info with summary for better filtering decisions
+    entities_info = []
+    for node in nodes:
+        info = {'name': node.name}
+        if node.summary:
+            info['summary'] = node.summary
+        # Include entity type for context
+        specific_type = next((l for l in node.labels if l != 'Entity'), None)
+        if specific_type:
+            info['type'] = specific_type
+        entities_info.append(info)
+    # ... rest of implementation ...
 ```
 
-#### 1.4 修改 extract_nodes 流程
+#### 1.4 Filter 步骤位置：extract_attributes 之后
 
-**文件**: `graphiti_core/utils/maintenance/node_operations.py`
+**重要变更**：Filter 步骤从 `extract_nodes()` 移到了 `graphiti.py` 的 `extract_attributes_from_nodes()` 之后。
 
-在 `extract_nodes()` 函数中，反思循环结束后添加过滤步骤：
+**原因**：
+- `extract_attributes_from_nodes` 会填充实体的 `summary` 属性
+- Filter 需要 summary 来更准确地判断实体是否应该保留
+- 在 summary 填充之前 filter 会导致误删合法实体
+
+**文件**: `graphiti_core/graphiti.py`
+
+**单 Episode 流程**（`add_episode` 方法）：
 
 ```python
-# 原有的 reflexion 循环结束后...
-
-# Filter entities using Knowledge Graph Builder's Principles
-llm_start = time()
-entities_to_remove = await filter_extracted_nodes(
-    llm_client,
-    episode,
-    extracted_entities,
-    episode.group_id,
+# 并行执行 resolve_edges 和 extract_attributes
+(resolved_edges, invalidated_edges), hydrated_nodes = await semaphore_gather(
+    resolve_edges_task, extract_attrs_task
 )
-llm_call_count += 1
-perf_logger.info(f'[PERF]     └─ extract_nodes filter #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
-# Remove filtered entities
-entities_to_remove_set = set(entities_to_remove)
-extracted_entities = [e for e in extracted_entities if e.name not in entities_to_remove_set]
+# Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+entity_types_context = [...]  # 构建实体类型上下文
+entities_to_remove = await filter_extracted_nodes(
+    self.llm_client,
+    episode,
+    hydrated_nodes,  # 已经有 summary
+    group_id,
+    entity_types_context,
+)
+if entities_to_remove:
+    # Filter nodes and their related edges
+    hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
+    # Also filter edges that reference removed nodes
+    resolved_edges = [e for e in resolved_edges if ...]
+```
+
+**批量 Episode 流程**（`_resolve_nodes_and_edges_bulk` 方法）：
+
+```python
+# Extract attributes for resolved nodes
+hydrated_nodes_results = await semaphore_gather(
+    *[extract_attributes_from_nodes(...) for episode, previous_episodes in episode_context]
+)
+
+# Filter each episode's nodes in parallel
+filter_results = await semaphore_gather(
+    *[filter_extracted_nodes(self.llm_client, episode, hydrated_nodes_results[i], ...) for i, ...]
+)
+
+# Collect all entities to remove and filter
+all_entities_to_remove = set()
+for entities_to_remove in filter_results:
+    all_entities_to_remove.update(entities_to_remove)
+
+if all_entities_to_remove:
+    # Filter nodes and edges
+    ...
 ```
 
 ### 效果
 
 - 减少噪声实体（代码变量、占位符等）的抽取
-- 提高实体分类准确率
+- **利用 summary 信息做更准确的过滤决策**
+- 匹配 Schema 实体类型的实体不会被误删
 - 知识图谱质量更高，更有价值
 
 ---

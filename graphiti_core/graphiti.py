@@ -95,6 +95,7 @@ from graphiti_core.utils.maintenance.graph_data_operations import (
 from graphiti_core.utils.maintenance.node_operations import (
     extract_attributes_from_nodes,
     extract_nodes,
+    filter_extracted_nodes,
     resolve_extracted_nodes,
 )
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
@@ -551,7 +552,56 @@ class Graphiti:
             ]
         )
 
+        # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+        entity_types_context = [
+            {
+                'entity_type_id': 0,
+                'entity_type_name': 'Entity',
+                'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+            }
+        ]
+        if entity_types:
+            entity_types_context += [
+                {
+                    'entity_type_id': i + 1,
+                    'entity_type_name': type_name,
+                    'entity_type_description': type_model.__doc__,
+                }
+                for i, (type_name, type_model) in enumerate(entity_types.items())
+            ]
+
+        # Filter each episode's nodes in parallel
+        filter_results: list[list[str]] = await semaphore_gather(
+            *[
+                filter_extracted_nodes(
+                    self.llm_client,
+                    episode,
+                    hydrated_nodes_results[i],
+                    episode.group_id,
+                    entity_types_context,
+                )
+                for i, (episode, _) in enumerate(episode_context)
+            ]
+        )
+
+        # Collect all entities to remove and filter hydrated_nodes_results
+        all_entities_to_remove: set[str] = set()
+        for entities_to_remove in filter_results:
+            all_entities_to_remove.update(entities_to_remove)
+
+        if all_entities_to_remove:
+            # Filter nodes in each episode's results
+            filtered_hydrated_nodes_results: list[list[EntityNode]] = []
+            for nodes in hydrated_nodes_results:
+                filtered_nodes = [n for n in nodes if n.name not in all_entities_to_remove]
+                filtered_hydrated_nodes_results.append(filtered_nodes)
+            hydrated_nodes_results = filtered_hydrated_nodes_results
+            logger.info(f'[bulk_filter] Filtered {len(all_entities_to_remove)} entities: {list(all_entities_to_remove)}')
+
         final_hydrated_nodes = [node for nodes in hydrated_nodes_results for node in nodes]
+
+        # Get UUIDs of removed nodes for edge filtering
+        removed_uuids = {n.uuid for n in nodes_by_uuid.values() if n.name in all_entities_to_remove}
 
         # Resolve edges with updated pointers
         edges_by_episode_unique: dict[str, list[EntityEdge]] = {}
@@ -562,6 +612,9 @@ class Graphiti:
 
             for edge in edges_with_updated_pointers:
                 if edge.uuid not in edges_uuid_set:
+                    # Filter out edges that reference removed nodes
+                    if edge.source_node_uuid in removed_uuids or edge.target_node_uuid in removed_uuids:
+                        continue
                     edges_by_episode_unique[episode_uuid].append(edge)
                     edges_uuid_set.add(edge.uuid)
 
@@ -817,6 +870,48 @@ class Graphiti:
                     resolve_edges_task, extract_attrs_task
                 )
                 perf_logger.info(f'[PERF] resolve_edges + extract_attrs (parallel): {(time() - step_start)*1000:.0f}ms, resolved={len(resolved_edges)}, invalidated={len(invalidated_edges)}')
+
+                # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+                step_start = time()
+                entity_types_context = [
+                    {
+                        'entity_type_id': 0,
+                        'entity_type_name': 'Entity',
+                        'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+                    }
+                ]
+                if entity_types:
+                    entity_types_context += [
+                        {
+                            'entity_type_id': i + 1,
+                            'entity_type_name': type_name,
+                            'entity_type_description': type_model.__doc__,
+                        }
+                        for i, (type_name, type_model) in enumerate(entity_types.items())
+                    ]
+                entities_to_remove = await filter_extracted_nodes(
+                    self.llm_client,
+                    episode,
+                    hydrated_nodes,
+                    group_id,
+                    entity_types_context,
+                )
+                if entities_to_remove:
+                    entities_to_remove_set = set(entities_to_remove)
+                    original_count = len(hydrated_nodes)
+                    hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
+                    # Also filter edges that reference removed nodes
+                    removed_uuids = {n.uuid for n in nodes if n.name in entities_to_remove_set}
+                    resolved_edges = [
+                        e for e in resolved_edges
+                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                    ]
+                    invalidated_edges = [
+                        e for e in invalidated_edges
+                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                    ]
+                    logger.info(f'Filtered {original_count - len(hydrated_nodes)} entities: {entities_to_remove}')
+                perf_logger.info(f'[PERF] filter_entities: {(time() - step_start)*1000:.0f}ms, removed={len(entities_to_remove)}')
 
                 entity_edges = resolved_edges + invalidated_edges
 
