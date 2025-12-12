@@ -94,7 +94,7 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
                                                     label: 'Entity',
                                                     stopwords: {stopwords_str}
                                                 }},
-                                                'name', 'summary', 'synonyms', 'group_id'
+                                                'name', 'summary', 'group_id'
                                                 )""",
                 f"""CALL db.idx.fulltext.createNodeIndex(
                                                 {{
@@ -110,7 +110,7 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
     if provider == GraphProvider.KUZU:
         return [
             "CALL CREATE_FTS_INDEX('Episodic', 'episode_content', ['content', 'source', 'source_description']);",
-            "CALL CREATE_FTS_INDEX('Entity', 'node_name_and_summary', ['name', 'summary', 'synonyms']);",
+            "CALL CREATE_FTS_INDEX('Entity', 'node_name_and_summary', ['name', 'summary']);",
             "CALL CREATE_FTS_INDEX('Community', 'community_name', ['name']);",
             "CALL CREATE_FTS_INDEX('RelatesToNode_', 'edge_name_and_fact', ['name', 'fact']);",
         ]
@@ -119,7 +119,7 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
         """CREATE FULLTEXT INDEX episode_content IF NOT EXISTS
         FOR (e:Episodic) ON EACH [e.content, e.source, e.source_description, e.group_id]""",
         """CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS
-        FOR (n:Entity) ON EACH [n.name, n.summary, n.synonyms, n.group_id]""",
+        FOR (n:Entity) ON EACH [n.name, n.summary, n.group_id]""",
         """CREATE FULLTEXT INDEX community_name IF NOT EXISTS
         FOR (n:Community) ON EACH [n.name, n.group_id]""",
         """CREATE FULLTEXT INDEX edge_name_and_fact IF NOT EXISTS

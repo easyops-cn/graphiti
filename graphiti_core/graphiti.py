@@ -787,23 +787,13 @@ class Graphiti:
                 )
                 perf_logger.info(f'[PERF] resolve_nodes + extract_edges (parallel): {(time() - step_start)*1000:.0f}ms, nodes={len(nodes)}, edges={len(extracted_edges)}')
 
-                # EasyOps: Record synonyms and merge reasoning from duplicate_pairs to canonical nodes
+                # EasyOps: Merge reasoning from duplicate_pairs to canonical nodes
                 for source_node, canonical_node in duplicate_pairs:
-                    # Merge reasoning
                     if source_node.reasoning and canonical_node.reasoning:
                         if source_node.reasoning not in canonical_node.reasoning:
                             canonical_node.reasoning = f"{canonical_node.reasoning}\n---\n{source_node.reasoning}"
                     elif source_node.reasoning and not canonical_node.reasoning:
                         canonical_node.reasoning = source_node.reasoning
-
-                    # Record synonyms
-                    if source_node.name and source_node.name != canonical_node.name:
-                        existing_synonyms = canonical_node.attributes.get('synonyms', '')
-                        synonym_list = existing_synonyms.split() if existing_synonyms else []
-                        if source_node.name not in synonym_list:
-                            synonym_list.append(source_node.name)
-                            canonical_node.attributes['synonyms'] = ' '.join(synonym_list)
-                            logger.info(f'[synonym] Recorded synonym "{source_node.name}" for entity "{canonical_node.name}"')
 
                 # Resolve edge pointers
                 step_start = time()

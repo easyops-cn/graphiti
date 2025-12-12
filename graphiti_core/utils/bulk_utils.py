@@ -199,14 +199,6 @@ def _merge_node_into_canonical(source: EntityNode, canonical: EntityNode) -> Non
     elif source.reasoning and not canonical.reasoning:
         canonical.reasoning = source.reasoning
 
-    # EasyOps: Record synonyms (space-separated string for BM25 full-text index)
-    if source.name and source.name != canonical.name:
-        existing_synonyms = canonical.attributes.get('synonyms', '')
-        synonym_list = existing_synonyms.split() if existing_synonyms else []
-        if source.name not in synonym_list:
-            synonym_list.append(source.name)
-            canonical.attributes['synonyms'] = ' '.join(synonym_list)
-
 
 async def semantic_dedupe_nodes_bulk(
     clients: GraphitiClients,
