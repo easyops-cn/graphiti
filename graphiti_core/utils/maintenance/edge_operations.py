@@ -556,7 +556,9 @@ async def resolve_extracted_edge(
                     f'[edge_dedup] Merged fact into existing edge {resolved.uuid[:8]}... '
                     f'(type: {resolved.name})'
                 )
-            return resolved, [], []
+            # Return the candidate edge as duplicate so bulk dedup can map extracted_edge to it
+            # This tells the caller: extracted_edge is a duplicate of `edge` (from related_edges)
+            return resolved, [edge], []
 
     start = time()
 

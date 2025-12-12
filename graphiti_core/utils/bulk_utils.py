@@ -729,27 +729,15 @@ async def dedupe_edges_bulk(
                 # Skip self-comparison
                 if edge.uuid == existing_edge.uuid:
                     continue
-                # Approximate BM25 by checking for word overlaps (this is faster than creating many in-memory indices)
-                # This approach will cast a wider net than BM25, which is ideal for this use case
+                # EasyOps customization: Match by (source, target, edge_type) instead of fact similarity
+                # This ensures edges with same type between same nodes are always deduplicated
                 if (
                     edge.source_node_uuid != existing_edge.source_node_uuid
                     or edge.target_node_uuid != existing_edge.target_node_uuid
                 ):
                     continue
-
-                edge_words = set(edge.fact.lower().split())
-                existing_edge_words = set(existing_edge.fact.lower().split())
-                has_overlap = not edge_words.isdisjoint(existing_edge_words)
-                if has_overlap:
-                    candidates.append(existing_edge)
-                    continue
-
-                # Check for semantic similarity even if there is no overlap
-                similarity = np.dot(
-                    normalize_l2(edge.fact_embedding or []),
-                    normalize_l2(existing_edge.fact_embedding or []),
-                )
-                if similarity >= min_score:
+                # Same source and target - check if same edge type
+                if edge.name == existing_edge.name:
                     candidates.append(existing_edge)
 
             dedupe_tuples.append((episode_tuples[i][0], edge, candidates))

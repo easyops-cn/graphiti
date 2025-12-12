@@ -366,15 +366,20 @@ async def _resolve_with_llm(
 
     llm_extracted_nodes = [extracted_nodes[i] for i in state.unresolved_indices]
 
+    # Build entity type definitions separately to avoid repetition
+    entity_type_definitions: dict[str, str] = {}
+    for node in llm_extracted_nodes:
+        for label in node.labels:
+            if label != 'Entity' and label not in entity_type_definitions:
+                type_model = entity_types_dict.get(label)
+                if type_model and type_model.__doc__:
+                    entity_type_definitions[label] = type_model.__doc__
+
     extracted_nodes_context = [
         {
             'id': i,
             'name': node.name,
             'entity_type': node.labels,
-            'entity_type_description': entity_types_dict.get(
-                next((item for item in node.labels if item != 'Entity'), '')
-            ).__doc__
-            or 'Default Entity Type',
         }
         for i, node in enumerate(llm_extracted_nodes)
     ]
@@ -415,6 +420,7 @@ async def _resolve_with_llm(
     context = {
         'extracted_nodes': extracted_nodes_context,
         'existing_nodes': existing_nodes_context,
+        'entity_type_definitions': entity_type_definitions,
         'episode_content': episode.content if episode is not None else '',
         'previous_episodes': (
             [ep.content for ep in previous_episodes] if previous_episodes is not None else []
@@ -492,6 +498,13 @@ async def _resolve_with_llm(
         state.uuid_map[extracted_node.uuid] = resolved_node.uuid
         if resolved_node.uuid != extracted_node.uuid:
             state.duplicate_pairs.append((extracted_node, resolved_node))
+            # Log deduplication decision with reasoning for debugging
+            logger.info(
+                'Dedupe: "%s" -> "%s" (reasoning: %s)',
+                extracted_node.name,
+                resolved_node.name,
+                resolution.reasoning or 'no reasoning provided',
+            )
 
 
 async def resolve_extracted_nodes(

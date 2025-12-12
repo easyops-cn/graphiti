@@ -36,6 +36,10 @@ class NodeDuplicate(BaseModel):
         ...,
         description='idx of all entities that are a duplicate of the entity with the above id.',
     )
+    reasoning: str = Field(
+        default='',
+        description='Brief explanation of why this entity is or is not a duplicate. Required when duplicate_idx != -1.',
+    )
 
 
 class NodeResolutions(BaseModel):
@@ -103,18 +107,30 @@ def node(context: dict[str, Any]) -> list[Message]:
                     "id": integer id from NEW ENTITY,
                     "name": the best full name for the entity,
                     "duplicate_idx": integer index of the best duplicate in EXISTING ENTITIES, or -1 if none,
-                    "duplicates": sorted list of all duplicate indices you collected (deduplicate the list, use [] when none)
+                    "duplicates": sorted list of all duplicate indices you collected (deduplicate the list, use [] when none),
+                    "reasoning": a brief explanation (1-2 sentences) of why you determined this entity is or is not a duplicate. REQUIRED when duplicate_idx != -1.
                 }}
             ]
         }}
 
         Only reference indices that appear in EXISTING ENTITIES, and return [] / -1 when unsure.
+        When marking as duplicate, explain what evidence shows they refer to the same real-world object.
         """,
         ),
     ]
 
 
 def nodes(context: dict[str, Any]) -> list[Message]:
+    # Build entity type definitions section if available
+    type_defs = context.get('entity_type_definitions', {})
+    type_defs_section = ''
+    if type_defs:
+        type_defs_section = f"""
+        <ENTITY TYPE DEFINITIONS>
+        {to_prompt_json(type_defs)}
+        </ENTITY TYPE DEFINITIONS>
+        """
+
     return [
         Message(
             role='system',
@@ -131,14 +147,14 @@ def nodes(context: dict[str, Any]) -> list[Message]:
         {context['episode_content']}
         </CURRENT MESSAGE>
 
+        {type_defs_section}
 
         Each of the following ENTITIES were extracted from the CURRENT MESSAGE.
         Each entity in ENTITIES is represented as a JSON object with the following structure:
         {{
             id: integer id of the entity,
             name: "name of the entity",
-            entity_type: ["Entity", "<optional additional label>", ...],
-            entity_type_description: "Description of what the entity type represents"
+            entity_type: ["Entity", "<optional additional label>", ...]
         }}
 
         <ENTITIES>
@@ -174,12 +190,15 @@ def nodes(context: dict[str, Any]) -> list[Message]:
             "id": integer id from ENTITIES,
             "name": the best full name for the entity (preserve the original name unless a duplicate has a more complete name),
             "duplicate_idx": the idx of the EXISTING ENTITY that is the best duplicate match, or -1 if there is no duplicate,
-            "duplicates": a sorted list of all idx values from EXISTING ENTITIES that refer to duplicates (deduplicate the list, use [] when none or unsure)
+            "duplicates": a sorted list of all idx values from EXISTING ENTITIES that refer to duplicates (deduplicate the list, use [] when none or unsure),
+            "reasoning": a brief explanation (1-2 sentences) of why you determined this entity is or is not a duplicate. REQUIRED when duplicate_idx != -1.
         }}
 
         - Only use idx values that appear in EXISTING ENTITIES.
         - Set duplicate_idx to the smallest idx you collected for that entity, or -1 if duplicates is empty.
         - Never fabricate entities or indices.
+        - When marking as duplicate, explain what evidence shows they refer to the same real-world object.
+        - When NOT marking as duplicate, you may leave reasoning empty or briefly explain why they are distinct.
         """,
         ),
     ]
