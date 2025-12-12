@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import MAX_REFLEXION_ITERATIONS, semaphore_gather
@@ -650,12 +650,44 @@ async def _extract_entity_attributes(
         prompt_name='extract_nodes.extract_attributes',
     )
 
-    # validate response
+    # validate response with graceful error handling for invalid enum values
     try:
         entity_type(**llm_response)
+    except ValidationError as e:
+        # EasyOps customization: handle invalid enum values gracefully
+        # Remove fields that failed validation instead of crashing
+        logger.warning(
+            f'Entity attribute validation warning for {entity_type.__name__}: {e}. '
+            f'Will remove invalid fields.'
+        )
+        logger.debug(f'LLM response was: {llm_response}')
+
+        # Extract field names that have validation errors
+        invalid_fields = set()
+        for error in e.errors():
+            if error.get('loc'):
+                field_name = error['loc'][0]
+                invalid_fields.add(field_name)
+                logger.warning(
+                    f'Removing invalid field "{field_name}" with value "{llm_response.get(field_name)}": '
+                    f'{error.get("msg")}'
+                )
+
+        # Remove invalid fields and try again
+        cleaned_response = {k: v for k, v in llm_response.items() if k not in invalid_fields}
+
+        # Validate cleaned response
+        try:
+            entity_type(**cleaned_response)
+            logger.info(f'Cleaned response validated successfully with {len(cleaned_response)} fields')
+            return cleaned_response
+        except ValidationError as e2:
+            logger.error(f'Entity attribute validation still failed after cleanup: {e2}')
+            # Return empty dict rather than crash
+            return {}
     except Exception as e:
-        logger.error(f"Entity attribute validation failed for {entity_type.__name__}: {e}")
-        logger.error(f"LLM response was: {llm_response}")
+        logger.error(f'Entity attribute validation failed for {entity_type.__name__}: {e}')
+        logger.error(f'LLM response was: {llm_response}')
         raise
 
     return llm_response
