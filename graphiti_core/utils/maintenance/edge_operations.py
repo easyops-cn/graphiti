@@ -258,19 +258,31 @@ async def resolve_extracted_edges(
     perf_logger = logging.getLogger('graphiti.performance')
     resolve_start = time()
 
-    # Fast path: deduplicate exact matches within the extracted edges before parallel processing
+    # EasyOps customization: Deduplicate by (source, target, edge_type) instead of (source, target, fact)
+    # This is deterministic - same relationship type between same entities should be one edge
+    # Facts from duplicate edges will be merged later by LLM
     seen: dict[tuple[str, str, str], EntityEdge] = {}
     deduplicated_edges: list[EntityEdge] = []
+    facts_to_merge: dict[str, list[str]] = {}  # edge_uuid -> list of facts to merge
 
     for edge in extracted_edges:
         key = (
             edge.source_node_uuid,
             edge.target_node_uuid,
-            _normalize_string_exact(edge.fact),
+            edge.name,  # Use edge type instead of fact
         )
         if key not in seen:
             seen[key] = edge
             deduplicated_edges.append(edge)
+            facts_to_merge[edge.uuid] = [edge.fact]
+        else:
+            # Collect facts to merge for this duplicate edge
+            canonical_edge = seen[key]
+            facts_to_merge[canonical_edge.uuid].append(edge.fact)
+            # Merge episode references
+            for ep_uuid in edge.episodes:
+                if ep_uuid not in canonical_edge.episodes:
+                    canonical_edge.episodes.append(ep_uuid)
 
     extracted_edges = deduplicated_edges
     perf_logger.info(f'[PERF]     └─ dedup_extracted_edges: edges_count={len(extracted_edges)}')
@@ -302,22 +314,23 @@ async def resolve_extracted_edges(
     perf_logger.info(f'[PERF]     └─ batch_search_embeddings: {(time() - step_start)*1000:.0f}ms, count={len(edge_facts)}')
 
     step_start = time()
-    related_edges_results: list[SearchResults] = await semaphore_gather(
-        *[
-            search(
-                clients,
-                extracted_edge.fact,
-                group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
-                search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
-                query_vector=fact_query_embeddings[i] if i < len(fact_query_embeddings) else None,
-            )
-            for i, (extracted_edge, valid_edges) in enumerate(zip(extracted_edges, valid_edges_list, strict=True))
+    # EasyOps customization: Build related_edges_lists directly from valid_edges_list by edge type
+    # instead of using embedding search. This ensures edges with same (source, target, edge_type)
+    # are always considered for deduplication, regardless of fact text similarity.
+    related_edges_lists: list[list[EntityEdge]] = []
+    for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True):
+        # Filter valid_edges by same edge type
+        related = [
+            edge for edge in valid_edges
+            if edge.name == extracted_edge.name
         ]
-    )
-    perf_logger.info(f'[PERF]     └─ search_related_edges (Hybrid): {(time() - step_start)*1000:.0f}ms')
-
-    related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
+        related_edges_lists.append(related)
+        if related:
+            logger.info(
+                f'[edge_dedup] Found {len(related)} existing edge(s) with same type ({extracted_edge.name}) '
+                f'between {extracted_edge.source_node_uuid[:8]}...→{extracted_edge.target_node_uuid[:8]}...'
+            )
+    perf_logger.info(f'[PERF]     └─ filter_related_edges_by_type: {(time() - step_start)*1000:.0f}ms')
 
     step_start = time()
     # EasyOps customization: Filter by same edge type to improve deduplication accuracy
@@ -521,17 +534,28 @@ async def resolve_extracted_edge(
     if len(related_edges) == 0 and len(existing_edges) == 0:
         return extracted_edge, [], []
 
-    # Fast path: if the fact text and endpoints already exist verbatim, reuse the matching edge.
-    normalized_fact = _normalize_string_exact(extracted_edge.fact)
+    # EasyOps customization: Fast path for deterministic edge dedup
+    # related_edges is already filtered by same edge type in resolve_extracted_edges(),
+    # so any edge in related_edges with same endpoints is a duplicate.
+    # We merge facts by concatenation here (LLM merge happens only in full dedup path).
     for edge in related_edges:
         if (
             edge.source_node_uuid == extracted_edge.source_node_uuid
             and edge.target_node_uuid == extracted_edge.target_node_uuid
-            and _normalize_string_exact(edge.fact) == normalized_fact
         ):
             resolved = edge
             if episode is not None and episode.uuid not in resolved.episodes:
                 resolved.episodes.append(episode.uuid)
+            # Merge facts by concatenation (simple, no LLM call)
+            new_fact = extracted_edge.fact.strip()
+            existing_fact = resolved.fact.strip() if resolved.fact else ''
+            if new_fact and existing_fact and new_fact not in existing_fact and existing_fact not in new_fact:
+                resolved.fact = f'{existing_fact} {new_fact}'
+                resolved.fact_embedding = None  # Clear for recalculation
+                logger.info(
+                    f'[edge_dedup] Merged fact into existing edge {resolved.uuid[:8]}... '
+                    f'(type: {resolved.name})'
+                )
             return resolved, [], []
 
     start = time()
@@ -591,22 +615,9 @@ async def resolve_extracted_edge(
 
     duplicate_fact_ids: list[int] = [i for i in duplicate_facts if 0 <= i < len(related_edges)]
 
-    # EasyOps customization: Force merge when same edge type exists between same node pair
-    # Even if LLM doesn't detect semantic duplicates, we should merge facts for edges
-    # with identical (source_uuid, target_uuid, edge_type) to avoid redundant edges.
-    if not duplicate_fact_ids and related_edges:
-        for i, edge in enumerate(related_edges):
-            if (
-                edge.source_node_uuid == extracted_edge.source_node_uuid
-                and edge.target_node_uuid == extracted_edge.target_node_uuid
-                and edge.name == extracted_edge.name  # Same edge type
-            ):
-                duplicate_fact_ids = [i]
-                logger.info(
-                    f'[edge_dedup] Force merge: same node pair and edge type ({edge.name}), '
-                    f'merging "{extracted_edge.fact[:50]}..." into existing edge {edge.uuid}'
-                )
-                break
+    # Note: The "Force merge" logic has been removed because the fast path above
+    # now handles all (source, target, edge_type) matches. If we reach this point,
+    # related_edges contains edges with different endpoints or we have no same-type edges.
 
     resolved_edge = extracted_edge
     for duplicate_fact_id in duplicate_fact_ids:

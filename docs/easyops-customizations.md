@@ -21,6 +21,7 @@
 | `graphiti_core/search/search_config.py` | 参数修改 | DEFAULT_SEARCH_LIMIT 从 10 改为 20 |
 | `graphiti_core/prompts/dedupe_edges.py` | 新增字段 | EdgeDuplicate 添加 merged_fact 字段 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 边去重时合并 fact 和属性 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | **边去重基于 (source, target, edge_type) 而非 fact** |
 
 ---
 
@@ -744,30 +745,61 @@ class EdgeDuplicate(BaseModel):
    - 去除冗余
    - 如果是不同语言，选择更详细或更一致的语言
 
-#### 7.3 强制合并同一对节点的边（2025-12-11 新增）
+#### 7.3 确定性边去重（2025-12-12 优化）
 
-**问题**：LLM 可能认为 "表单设计功能" 和 "表单库功能" 不是语义重复，返回 `duplicate_facts: []`。但如果这两条边连接的是同一对节点（source_uuid, target_uuid）且边类型相同，则应该强制合并，否则会产生重复边。
+**核心改进**：边去重从"LLM 判断是否重复"改为"程序确定性判断 + LLM 合并 fact"。
+
+**原理**：`(source_uuid, target_uuid, edge_type)` 相同的边就是同一条边，这是确定性逻辑，不需要 LLM 判断。LLM 只负责合并不同表述的 fact。
 
 **文件**: `graphiti_core/utils/maintenance/edge_operations.py`
 
-在 `resolve_extracted_edge` 函数中添加强制合并逻辑：
+**批内去重** - `resolve_extracted_edges()` 函数：
 
 ```python
-# 即使 LLM 不认为是重复，如果同一对节点间已有同类型边，也要强制合并
-if not duplicate_fact_ids and related_edges:
-    for i, edge in enumerate(related_edges):
-        if (
-            edge.source_node_uuid == extracted_edge.source_node_uuid
-            and edge.target_node_uuid == extracted_edge.target_node_uuid
-            and edge.name == extracted_edge.name  # 同一边类型
-        ):
-            duplicate_fact_ids = [i]
-            logger.info(
-                f'[edge_dedup] Force merge: same node pair and edge type ({edge.name}), '
-                f'merging "{extracted_edge.fact[:50]}..." into existing edge {edge.uuid}'
-            )
-            break
+# 原来：基于 (source, target, fact) 去重
+key = (
+    edge.source_node_uuid,
+    edge.target_node_uuid,
+    _normalize_string_exact(edge.fact),  # fact 不同就认为是不同的边
+)
+
+# 修改后：基于 (source, target, edge_type) 去重
+key = (
+    edge.source_node_uuid,
+    edge.target_node_uuid,
+    edge.name,  # edge_type 相同就是同一条边
+)
+if key not in seen:
+    seen[key] = edge
+    facts_to_merge[edge.uuid] = [edge.fact]
+else:
+    # 同一对节点的同类型边，收集 fact 待合并
+    canonical_edge = seen[key]
+    facts_to_merge[canonical_edge.uuid].append(edge.fact)
+    # 合并 episode 引用
+    for ep_uuid in edge.episodes:
+        if ep_uuid not in canonical_edge.episodes:
+            canonical_edge.episodes.append(ep_uuid)
 ```
+
+**与数据库已有边去重** - `resolve_extracted_edge()` 函数的快速路径：
+
+```python
+# 原来：基于 (source, target, fact) 精确匹配
+if _normalize_string_exact(edge.fact) == normalized_fact:
+    return resolved, [], []
+
+# 修改后：基于 (source, target, edge_type) 匹配
+if edge.name == extracted_edge.name:  # 同边类型 = 重复
+    resolved = edge
+    resolved.episodes.append(episode.uuid)
+    return resolved, [extracted_edge], []  # 标记为重复，调用方处理 fact 合并
+```
+
+**效果**：
+- 同一对节点间、同一边类型的边，无论 fact 如何不同，都会被识别为同一条边
+- 多条 fact 描述会被合并（LLM 合并或拼接）
+- 避免创建语义重复的边
 
 #### 7.4 修改合并逻辑
 
