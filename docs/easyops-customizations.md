@@ -7,6 +7,7 @@
 | 文件 | 修改类型 | 说明 |
 |------|---------|------|
 | `graphiti_core/models/edges/edge_db_queries.py` | 新增函数 | 支持动态边类型的 Cypher 查询 |
+| `graphiti_core/models/edges/edge_db_queries.py` | 逻辑修改 | MERGE 按节点对合并，避免重复边 |
 | `graphiti_core/utils/bulk_utils.py` | 逻辑修改 | 按边类型分组保存 |
 | `graphiti_core/utils/bulk_utils.py` | 新增函数 | 批量去重第三轮 LLM 语义去重 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
@@ -19,6 +20,9 @@
 | `graphiti_core/prompts/dedupe_edges.py` | 新增字段 | EdgeDuplicate 添加 merged_fact 字段 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 边去重时合并 fact 和属性 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | **边去重基于 (source, target, edge_type) 而非 fact** |
+| `graphiti_core/prompts/dedupe_nodes.py` | 新增字段 | NodeDuplicate 添加 reasoning 字段 |
+| `graphiti_core/prompts/dedupe_nodes.py` | Prompt优化 | 实体去重要求输出 reasoning，entity_type_definitions 独立 |
+| `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | `_resolve_with_llm()` 独立提取类型定义，添加 reasoning 日志 |
 
 ---
 
