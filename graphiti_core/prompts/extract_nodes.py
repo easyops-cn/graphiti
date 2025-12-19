@@ -69,6 +69,95 @@ class ExtractedEntity(BaseModel):
     )
 
 
+# Type scoring models for more deliberate classification decisions
+class TopTypeCandidate(BaseModel):
+    """Top candidate type with score and reasoning."""
+    type_id: int = Field(..., description='The entity_type_id being scored')
+    score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description='Confidence score from 0.0 to 1.0. '
+                    '1.0 = perfect match, 0.0 = definitely not this type',
+    )
+    reasoning: str = Field(
+        ...,
+        description='Brief explanation of why this score was given',
+    )
+
+
+class ExtractedEntityWithScores(BaseModel):
+    """Entity with top 3 candidate types (reduced token output)."""
+    name: str = Field(
+        ...,
+        description='Name of the extracted entity',
+        validation_alias=AliasChoices('name', 'entity_name'),
+    )
+    top_candidates: list[TopTypeCandidate] = Field(
+        ...,
+        description='Top 3 most likely entity types with scores. '
+                    'Sorted by score descending. Maximum 3 candidates.',
+        min_length=1,
+        max_length=3,
+    )
+    final_type_id: int = Field(
+        ...,
+        description='The entity_type_id of the best matching type (highest score)',
+    )
+
+
+class ExtractedEntitiesWithScores(BaseModel):
+    """Collection of extracted entities with top candidate scores."""
+    extracted_entities: list[ExtractedEntityWithScores] = Field(
+        ...,
+        description='List of extracted entities with top 3 type candidates',
+        validation_alias=AliasChoices('extracted_entities', 'entities'),
+    )
+
+
+# Second-pass type resolution for ambiguous entities (multiple high scores)
+class AmbiguousEntityInput(BaseModel):
+    """Input for ambiguous entity type resolution."""
+    name: str = Field(..., description='Name of the entity')
+    candidate_type_ids: list[int] = Field(
+        ...,
+        description='List of candidate type_ids to choose from',
+    )
+
+
+class CandidateTypeScore(BaseModel):
+    """Score for a candidate type in second-pass resolution."""
+    type_id: int = Field(..., description='The entity_type_id being scored')
+    score: float = Field(..., description='Confidence score from 0.0 to 1.0')
+    reasoning: str = Field(..., description='Why this type received this score')
+
+
+class ResolvedEntityType(BaseModel):
+    """Resolved type for an ambiguous entity with scoring."""
+    name: str = Field(..., description='Name of the entity')
+    chosen_type_id: int = Field(..., description='The chosen entity_type_id (highest score)')
+    reasoning: str = Field(
+        ...,
+        description='Explanation of why this type is the best fit',
+    )
+    candidate_scores: list[CandidateTypeScore] = Field(
+        ...,
+        description='Scores for each candidate type, sorted by score descending',
+    )
+
+
+class ResolvedEntityTypes(BaseModel):
+    """Batch resolution results for ambiguous entities."""
+    resolutions: list[ResolvedEntityType] = Field(
+        ...,
+        description='Type resolution for each ambiguous entity',
+    )
+
+
+# Keep old TypeScore as alias for backward compatibility
+TypeScore = TopTypeCandidate
+
+
 class ExtractedEntities(BaseModel):
     extracted_entities: list[ExtractedEntity] = Field(
         ...,
@@ -78,7 +167,28 @@ class ExtractedEntities(BaseModel):
 
 
 class MissedEntities(BaseModel):
-    missed_entities: list[str] = Field(..., description="Names of entities that weren't extracted")
+    missed_entities: list[str] = Field(
+        default_factory=list,
+        description="Names of entities that weren't extracted but should be"
+    )
+    entities_to_remove: list[str] = Field(
+        default_factory=list,
+        description='Names of extracted entities that should NOT be in the knowledge graph '
+        '(e.g., too generic, transient concepts, document artifacts)',
+    )
+    entities_to_reclassify: list['EntityReclassification'] = Field(
+        default_factory=list,
+        description='Entities that were misclassified and should be assigned a different type',
+    )
+
+
+class EntityReclassification(BaseModel):
+    name: str = Field(..., description='Name of the entity to reclassify')
+    new_type: str = Field(
+        ...,
+        description='The correct entity type name from VALID ENTITY TYPES. Must be an exact match.',
+    )
+    reason: str = Field(..., description='Brief explanation of why this type is more appropriate')
 
 
 class EntitiesToFilter(BaseModel):
@@ -86,9 +196,26 @@ class EntitiesToFilter(BaseModel):
         ...,
         description='Names of entities that should be removed from the knowledge graph',
     )
+    entities_to_reclassify: list[EntityReclassification] = Field(
+        default_factory=list,
+        description='Entities that were misclassified and should be assigned a different type',
+    )
     reasoning: str = Field(
         ...,
-        description='Brief explanation of why these entities were flagged for removal',
+        description='Brief explanation of why these entities were flagged for removal or reclassification',
+    )
+
+
+# Step 1: Validate entity against its assigned type
+class EntityValidationItem(BaseModel):
+    name: str = Field(..., description='Name of the entity')
+    is_valid: bool = Field(..., description='True if entity matches its assigned type definition')
+    reason: str = Field(..., description='Brief explanation of why it matches or does not match')
+
+
+class EntityValidationResult(BaseModel):
+    validations: list[EntityValidationItem] = Field(
+        ..., description='Validation results for each entity'
     )
 
 
@@ -114,26 +241,55 @@ class EntitySummary(BaseModel):
     )
 
 
+# EasyOps: Batch summary extraction models
+class EntitySummaryItem(BaseModel):
+    """Summary for a single entity in batch extraction."""
+
+    entity_id: int = Field(..., description='The ID of the entity from the input list')
+    summary: str = Field(
+        ...,
+        description=f'Summary containing the important information about the entity. Under {MAX_SUMMARY_CHARS} characters.',
+    )
+
+
+class EntitySummaries(BaseModel):
+    """Batch of entity summaries."""
+
+    summaries: list[EntitySummaryItem] = Field(
+        ..., description='List of summaries for each entity'
+    )
+
+
 class Prompt(Protocol):
     extract_message: PromptVersion
     extract_json: PromptVersion
     extract_text: PromptVersion
+    extract_text_with_scores: PromptVersion
+    extract_message_with_scores: PromptVersion
     reflexion: PromptVersion
     filter_entities: PromptVersion
+    validate_entity_types: PromptVersion
     classify_nodes: PromptVersion
     extract_attributes: PromptVersion
     extract_summary: PromptVersion
+    extract_summaries_bulk: PromptVersion  # EasyOps: batch summary extraction
+    resolve_ambiguous_types: PromptVersion
 
 
 class Versions(TypedDict):
     extract_message: PromptFunction
     extract_json: PromptFunction
     extract_text: PromptFunction
+    extract_text_with_scores: PromptFunction
+    extract_message_with_scores: PromptFunction
     reflexion: PromptFunction
     filter_entities: PromptFunction
+    validate_entity_types: PromptFunction
     classify_nodes: PromptFunction
     extract_attributes: PromptFunction
     extract_summary: PromptFunction
+    extract_summaries_bulk: PromptFunction  # EasyOps: batch summary extraction
+    resolve_ambiguous_types: PromptFunction
 
 
 def extract_message(context: dict[str, Any]) -> list[Message]:
@@ -267,8 +423,142 @@ Guidelines:
     ]
 
 
+def extract_text_with_scores(context: dict[str, Any]) -> list[Message]:
+    """Extract entities with top 3 type candidates for efficient classification.
+
+    This version only outputs the top 3 most likely types per entity,
+    reducing token consumption while maintaining classification accuracy.
+    """
+    sys_prompt = f"""You are an AI assistant that extracts entity nodes from text for building an enterprise knowledge graph.
+Your task is to extract significant entities and identify the TOP 3 most likely types for each.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}
+
+**TYPE SCORING PROCESS**:
+For each entity you extract:
+1. Quickly scan ALL entity types to identify the 3 most likely candidates
+2. Score each of these 3 candidates from 0.0 to 1.0
+3. Provide reasoning for each score
+4. Set final_type_id to the highest-scoring candidate"""
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<TEXT>
+{context['episode_content']}
+</TEXT>
+
+Extract entities from the text. For each entity, output ONLY the top 3 most likely types.
+
+{context['custom_prompt']}
+
+**SCORING GUIDELINES**:
+- Score 0.9-1.0: Perfect match - entity clearly fits the type's IS examples
+- Score 0.7-0.8: Strong match - entity likely fits this type
+- Score 0.5-0.6: Partial match - some characteristics match
+- Score 0.0-0.4: Weak match - poor fit but still a candidate
+
+**OUTPUT REQUIREMENTS**:
+For each extracted entity:
+1. `top_candidates`: List exactly 3 candidates (or fewer if less than 3 types exist), sorted by score descending
+   - Each candidate needs: type_id, score, reasoning (why this score)
+2. `final_type_id`: The type_id with the highest score
+
+**ENTITY EXTRACTION GUIDELINES**:
+1. Extract significant entities, concepts, or actors mentioned in the text
+2. Avoid creating nodes for relationships, actions, or temporal information
+3. Be explicit in entity names, using full names when available
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
+def extract_message_with_scores(context: dict[str, Any]) -> list[Message]:
+    """Extract entities from messages with top 3 type candidates for efficient classification."""
+    sys_prompt = f"""You are an AI assistant that extracts entity nodes from conversational messages for building an enterprise knowledge graph.
+Your task is to extract entities and identify the TOP 3 most likely types for each.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}
+
+**TYPE SCORING PROCESS**:
+For each entity you extract:
+1. Quickly scan ALL entity types to identify the 3 most likely candidates
+2. Score each of these 3 candidates from 0.0 to 1.0
+3. Provide reasoning for each score
+4. Set final_type_id to the highest-scoring candidate"""
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<PREVIOUS MESSAGES>
+{to_prompt_json([ep for ep in context['previous_episodes']])}
+</PREVIOUS MESSAGES>
+
+<CURRENT MESSAGE>
+{context['episode_content']}
+</CURRENT MESSAGE>
+
+Extract entities from the CURRENT MESSAGE. For each entity, output ONLY the top 3 most likely types.
+
+{context['custom_prompt']}
+
+**EXTRACTION RULES**:
+1. Always extract the speaker as the first entity
+2. Extract significant entities mentioned in CURRENT MESSAGE only
+3. Disambiguate pronouns to actual entity names
+
+**SCORING GUIDELINES**:
+- Score 0.9-1.0: Perfect match - entity clearly fits the type's IS examples
+- Score 0.7-0.8: Strong match - entity likely fits this type
+- Score 0.5-0.6: Partial match - some characteristics match
+- Score 0.0-0.4: Weak match - poor fit but still a candidate
+
+**OUTPUT REQUIREMENTS**:
+For each extracted entity:
+1. `top_candidates`: List exactly 3 candidates (or fewer if less than 3 types exist), sorted by score descending
+   - Each candidate needs: type_id, score, reasoning (why this score)
+2. `final_type_id`: The type_id with the highest score
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
 def reflexion(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are an AI assistant that determines which entities have not been extracted from the given context"""
+    sys_prompt = """You are an AI assistant that reviews entity extraction quality. You perform both:
+1. **Positive reflexion**: Identify entities that SHOULD have been extracted but weren't
+2. **Negative reflexion**: Identify entities that should NOT have been extracted or were misclassified
+
+Review each extracted entity against the Knowledge Graph Builder's Principles:
+
+1. **Permanence Principle**: Does it have lasting value beyond this document?
+2. **Connectivity Principle**: Can it meaningfully connect to other entities?
+3. **Independence Principle**: Is the name self-explanatory without the source text?
+4. **Domain Value Principle**: Does it represent real domain knowledge, not document artifacts?
+
+An entity should be REMOVED if it fails ANY of these principles AND cannot be reclassified to a valid type.
+
+**CRITICAL**: Do NOT trust pre-assigned types blindly. You MUST re-validate the entity against the type's definition in VALID ENTITY TYPES. If the entity does not actually match its assigned type's criteria (especially the IS/IS NOT examples in the type description):
+- If it matches a DIFFERENT valid type, RECLASSIFY it
+- If it doesn't match ANY valid type, REMOVE it"""
+
+    # Build entity types reference if available
+    entity_types_ref = ''
+    if context.get('entity_types'):
+        entity_types_ref = '\n<VALID ENTITY TYPES>\n'
+        for et in context['entity_types']:
+            name = et.get('entity_type_name', et.get('name', ''))
+            desc = et.get('entity_type_description', et.get('description', ''))
+            if name and name != 'Entity':
+                entity_types_ref += f"- {name}: {desc}\n"
+        entity_types_ref += '</VALID ENTITY TYPES>\n'
 
     user_prompt = f"""
 <PREVIOUS MESSAGES>
@@ -281,9 +571,32 @@ def reflexion(context: dict[str, Any]) -> list[Message]:
 <EXTRACTED ENTITIES>
 {context['extracted_entities']}
 </EXTRACTED ENTITIES>
+{entity_types_ref}
+Review the extraction quality and provide:
 
-Given the above previous messages, current message, and list of extracted entities; determine if any entities haven't been
-extracted.
+1. **missed_entities**: Names of significant entities mentioned in CURRENT MESSAGE that weren't extracted
+   - Focus on entities with lasting value that can connect to other concepts
+
+2. **entities_to_remove**: Names of extracted entities that should be REMOVED because they:
+   - Are too generic or vague (e.g., "it", "the system", "this thing")
+   - Are transient/temporary concepts with no lasting value
+   - Are document artifacts, not real domain knowledge
+   - Cannot meaningfully connect to other entities
+   - MISCLASSIFIED and don't match ANY valid type
+
+3. **entities_to_reclassify**: Entities with wrong type assignment
+   - For each entity with a pre-assigned type, RE-VALIDATE against that type's definition
+   - Check if it matches the type's IS examples (keep current type)
+   - Check if it matches the type's IS NOT examples (needs reclassification)
+   - Only include if the entity matches a DIFFERENT valid type
+   - Provide: name, new_type (must be exact match from VALID ENTITY TYPES), reason
+
+**Common Misclassifications to Watch For**:
+- Metric IDs (like system_cpu_cores, memory_usage) are NOT Components - Components are deployable services
+- Table columns or field names are NOT Models - Models are schema definitions
+- Generic technical terms are NOT Features - Features have specific product functionality
+
+Return empty lists if the extraction quality is good.
 """
     return [
         Message(role='system', content=sys_prompt),
@@ -292,7 +605,7 @@ extracted.
 
 
 def filter_entities(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are a knowledge graph quality reviewer. Your task is to identify entities that should NOT be in an enterprise knowledge graph.
+    sys_prompt = """You are a knowledge graph quality reviewer. Your task is to identify entities that should NOT be in an enterprise knowledge graph, or entities that were misclassified and need type correction.
 
 Review each extracted entity against the Knowledge Graph Builder's Principles:
 
@@ -301,9 +614,11 @@ Review each extracted entity against the Knowledge Graph Builder's Principles:
 3. **Independence Principle**: Is the name self-explanatory without the source text?
 4. **Domain Value Principle**: Does it represent real domain knowledge, not document artifacts?
 
-An entity should be REMOVED if it fails ANY of these principles.
+An entity should be REMOVED if it fails ANY of these principles AND cannot be reclassified to a valid type.
 
-**IMPORTANT**: Before removing an entity, check if it matches any of the VALID ENTITY TYPES defined in the schema. If an entity clearly belongs to a defined type (based on the type's description and examples), it should be KEPT even if it seems document-specific."""
+**CRITICAL**: Entities may have a pre-assigned "type" from the extraction step. Do NOT trust this type blindly. You MUST re-validate the entity against the type's definition in VALID ENTITY TYPES. If the entity does not actually match its assigned type's criteria (especially the IS/IS NOT examples in the type description):
+- If it matches a DIFFERENT valid type, RECLASSIFY it
+- If it doesn't match ANY valid type, REMOVE it"""
 
     # Build entity types reference if available
     entity_types_ref = ''
@@ -329,20 +644,80 @@ An entity should be REMOVED if it fails ANY of these principles.
 Review each extracted entity. The entity info includes name, and may include summary and type.
 Use the summary to better understand what the entity represents.
 
-Return the **names** of entities that FAIL the Knowledge Graph Builder's Principles.
-
 **Decision Process**:
-1. First, check if the entity matches any VALID ENTITY TYPE (if provided). If it clearly fits a defined type based on the type's description and examples, KEEP it.
-2. Only if the entity doesn't match any valid type, apply the four principles strictly.
+1. If the entity has a pre-assigned type, RE-VALIDATE it against that type's definition in VALID ENTITY TYPES:
+   - Check if it matches the type's criteria (judgment standards)
+   - Check if it matches the IS examples (should be kept with current type)
+   - Check if it matches the IS NOT examples (needs reclassification or removal)
+   - If MISCLASSIFIED but matches a DIFFERENT valid type → add to entities_to_reclassify
+   - If MISCLASSIFIED and doesn't match ANY valid type → add to entities_to_remove
+2. If the entity has no type or type is "Entity", check if it matches any valid type:
+   - If it matches a valid type → add to entities_to_reclassify with the correct type
+   - If it doesn't match any type, apply the four principles strictly
 
-These entities should typically be removed:
-- Variables, function names, or IDs that only make sense within code examples
-- Placeholder values or template markers (e.g., $1, fwjfl7towi)
-- Generic process terms without specific domain meaning (unless they match a valid entity type)
-- Technical artifacts of document formatting
-- Concepts that require the source document to understand (unless they match a valid entity type)
+**Common Misclassifications to Watch For**:
+- Metric IDs (like system_cpu_cores, system_memory_total) are NOT Components - Components are deployable services
+- Table columns or field names are NOT CmdbModels - CmdbModels are model definitions
+- Generic technical terms are NOT Features - Features have menu entries in the product
 
-Return an empty list if all entities pass the quality check.
+**Output Format**:
+- entities_to_remove: Names of entities that fail quality checks and don't match any valid type
+- entities_to_reclassify: Entities with wrong type that should be corrected (include name, new_type, reason)
+- reasoning: Brief explanation of your decisions
+
+Return empty lists if all entities pass the quality check with correct types.
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
+def validate_entity_types(context: dict[str, Any]) -> list[Message]:
+    """Step 1: Validate each entity against its assigned type definition only.
+
+    This is a focused validation - each entity is checked against ONLY its current type.
+    No episode content needed, just entity summary + type definition.
+    """
+    sys_prompt = f"""You are a type validator for a knowledge graph. Your task is to verify if each entity truly matches its assigned type definition.
+
+For each entity, you will receive:
+- Entity name and summary
+- The FULL definition of its assigned type (including IS/IS NOT examples)
+
+You must check if the entity matches the type's criteria.
+
+{KNOWLEDGE_GRAPH_PRINCIPLES}"""
+
+    # Build entities with their type definitions
+    entities_with_defs = []
+    for entity in context['entities']:
+        entity_info = {
+            'name': entity['name'],
+            'summary': entity.get('summary', ''),
+            'assigned_type': entity.get('type', 'Entity'),
+            'type_definition': entity.get('type_definition', ''),
+        }
+        entities_with_defs.append(entity_info)
+
+    entities_json = to_prompt_json(entities_with_defs)
+
+    user_prompt = f"""
+<ENTITIES TO VALIDATE>
+{entities_json}
+</ENTITIES TO VALIDATE>
+
+For each entity, determine if it truly matches its assigned type based on the type_definition provided.
+
+**Validation Rules**:
+1. Read the type_definition carefully, especially the IS and IS NOT examples
+2. Compare the entity's name and summary against the criteria
+3. If the entity matches IS examples → is_valid = true
+4. If the entity matches IS NOT examples → is_valid = false
+5. If uncertain but the entity could reasonably fit the type → is_valid = true (preserve valuable entities)
+6. Provide a clear reason for your decision
+
+Return validation result for EVERY entity in the list.
 """
     return [
         Message(role='system', content=sys_prompt),
@@ -438,13 +813,135 @@ def extract_summary(context: dict[str, Any]) -> list[Message]:
     ]
 
 
+# EasyOps: Batch summary extraction - process multiple entities in one LLM call
+def extract_summaries_bulk(context: dict[str, Any]) -> list[Message]:
+    """Extract summaries for multiple entities in a single LLM call.
+
+    Context should contain:
+    - entities: list of dicts with 'id', 'name', 'summary' (existing), 'entity_types', 'attributes'
+    - episode_content: current episode content
+    - previous_episodes: list of previous episode contents
+    """
+    return [
+        Message(
+            role='system',
+            content='You are a helpful assistant that extracts entity summaries from the provided text. '
+            'You will process multiple entities at once and return a summary for each.',
+        ),
+        Message(
+            role='user',
+            content=f"""
+Given the MESSAGES and the list of ENTITIES, update the summary for EACH entity.
+Combine relevant information about each entity from the messages with any existing summary.
+
+{summary_instructions}
+
+<MESSAGES>
+{to_prompt_json(context['previous_episodes'])}
+{to_prompt_json(context['episode_content'])}
+</MESSAGES>
+
+<ENTITIES>
+{to_prompt_json(context['entities'])}
+</ENTITIES>
+
+For each entity in the list above, provide a summary. Return a JSON object with a "summaries" array.
+Each item in the array must have:
+- "entity_id": the ID from the input entity
+- "summary": the updated summary for that entity
+
+Process ALL entities in the list. Do not skip any entity.
+""",
+        ),
+    ]
+
+
+def resolve_ambiguous_types(context: dict[str, Any]) -> list[Message]:
+    """Resolve ambiguous entity types when multiple candidates have close scores.
+
+    This is a second-pass resolution that requires scoring ALL candidate types,
+    similar to the first pass, to ensure consistent and comparable decisions.
+    """
+    sys_prompt = """You are an AI assistant that helps classify entities into the most appropriate type.
+For each entity, you will be given a list of candidate types. Your task is to SCORE each candidate and select the best one.
+
+**SCORING PROCESS** (same as first-pass extraction):
+1. Score EACH candidate type from 0.0 to 1.0
+2. Provide reasoning for each score
+3. Select the highest-scoring type as chosen_type_id
+
+**SCORING GUIDELINES**:
+- Score 0.9-1.0: Perfect match - entity clearly fits the type's IS examples
+- Score 0.7-0.8: Strong match - entity likely fits this type
+- Score 0.5-0.6: Partial match - some characteristics match
+- Score 0.0-0.4: Weak match - poor fit
+
+**DECISION CRITERIA**:
+1. Consider the entity name and how it's used in the context
+2. Match against each candidate type's definition, judgment standards, and IS/IS NOT examples
+3. Choose the type that best captures the entity's primary role or nature
+
+**CRITICAL: Each entity must have its own separate resolution with ALL candidate scores.**"""
+
+    user_prompt = f"""
+<ORIGINAL TEXT>
+{context['episode_content']}
+</ORIGINAL TEXT>
+
+<ENTITIES TO CLASSIFY>
+{context['ambiguous_entities']}
+</ENTITIES TO CLASSIFY>
+
+<CANDIDATE TYPES>
+{context['candidate_types']}
+</CANDIDATE TYPES>
+
+For each entity listed above:
+1. Score EACH candidate type (not just the best one)
+2. Provide reasoning for each score
+3. Set chosen_type_id to the highest-scoring candidate
+
+**OUTPUT FORMAT**:
+Return a `resolutions` array where EACH entity has ALL candidate scores:
+
+Example for 1 entity with 2 candidates:
+{{
+  "resolutions": [
+    {{
+      "name": "Entity A",
+      "chosen_type_id": 2,
+      "reasoning": "Overall reasoning for final choice",
+      "candidate_scores": [
+        {{"type_id": 2, "score": 0.85, "reasoning": "Why type 2 scored 0.85"}},
+        {{"type_id": 6, "score": 0.70, "reasoning": "Why type 6 scored 0.70"}}
+      ]
+    }}
+  ]
+}}
+
+**IMPORTANT**:
+- Each entity gets its own object in the resolutions array
+- candidate_scores must include ALL candidate types, sorted by score descending
+- The `name` must match exactly with the entity name from ENTITIES TO CLASSIFY
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
 versions: Versions = {
     'extract_message': extract_message,
     'extract_json': extract_json,
     'extract_text': extract_text,
+    'extract_text_with_scores': extract_text_with_scores,
+    'extract_message_with_scores': extract_message_with_scores,
     'reflexion': reflexion,
     'filter_entities': filter_entities,
+    'validate_entity_types': validate_entity_types,
     'extract_summary': extract_summary,
+    'extract_summaries_bulk': extract_summaries_bulk,  # EasyOps: batch summary extraction
     'classify_nodes': classify_nodes,
     'extract_attributes': extract_attributes,
+    'resolve_ambiguous_types': resolve_ambiguous_types,
 }

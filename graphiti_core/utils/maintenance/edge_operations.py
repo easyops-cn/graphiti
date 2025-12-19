@@ -34,7 +34,7 @@ from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
-from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
+from graphiti_core.prompts.dedupe_edges import EdgeDuplicate, EdgeDuplicateWithScores
 from graphiti_core.prompts.extract_edges import ExtractedEdges, MissingFacts
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
@@ -46,6 +46,10 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
 DEFAULT_EDGE_NAME = 'RELATES_TO'
 
 logger = logging.getLogger(__name__)
+
+# Threshold for edge type classification confidence
+# If the best type score is below this threshold, use DEFAULT edge type
+EDGE_TYPE_CONFIDENCE_THRESHOLD = 0.6
 
 
 def build_episodic_edges(
@@ -164,7 +168,48 @@ async def extract_edges(
             llm_call_count += 1
             perf_logger.info(f'[PERF]       └─ extract_edges reflexion #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
-            missing_facts = reflexion_response.get('missing_facts', [])
+            reflexion_result = MissingFacts(**reflexion_response)
+
+            # Handle negative reflexion: remove facts that shouldn't have been extracted
+            facts_to_remove = reflexion_result.facts_to_remove
+            if facts_to_remove:
+                facts_to_remove_set = set(facts_to_remove)
+                original_count = len(edges_data)
+                edges_data = [e for e in edges_data if e.fact not in facts_to_remove_set]
+                logger.info(
+                    f'Negative reflexion removed {original_count - len(edges_data)} facts: '
+                    f'{facts_to_remove}'
+                )
+                # Update context with cleaned facts
+                context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
+
+            # Handle fact corrections: update relation_type
+            facts_to_correct = reflexion_result.facts_to_correct
+            if facts_to_correct:
+                correction_map = {c.original_fact: c for c in facts_to_correct}
+                for edge_data in edges_data:
+                    if edge_data.fact in correction_map:
+                        correction = correction_map[edge_data.fact]
+                        if correction.issue == 'wrong_relation_type' and correction.corrected_relation_type:
+                            old_type = edge_data.relation_type
+                            edge_data.relation_type = correction.corrected_relation_type
+                            logger.info(
+                                f'Corrected relation_type for fact "{edge_data.fact}": '
+                                f'{old_type} -> {correction.corrected_relation_type}'
+                            )
+                        elif correction.issue == 'nonexistent_relationship':
+                            # Mark for removal
+                            facts_to_remove_set = facts_to_remove_set if facts_to_remove else set()
+                            facts_to_remove_set.add(edge_data.fact)
+                            logger.info(f'Marked nonexistent relationship for removal: "{edge_data.fact}"')
+
+                # Final filter for nonexistent relationships
+                if facts_to_correct:
+                    edges_data = [e for e in edges_data if e.fact not in facts_to_remove_set]
+                    context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
+
+            # Handle positive reflexion: add missed facts to next extraction
+            missing_facts = reflexion_result.missing_facts
 
             custom_prompt = 'The following facts were missed in a previous extraction: '
             for fact in missing_facts:
@@ -598,12 +643,12 @@ async def resolve_extracted_edge(
         )
 
     llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_edges.resolve_edge(context),
-        response_model=EdgeDuplicate,
+        prompt_library.dedupe_edges.resolve_edge_with_scores(context),
+        response_model=EdgeDuplicateWithScores,
         model_size=ModelSize.small,
-        prompt_name='dedupe_edges.resolve_edge',
+        prompt_name='dedupe_edges.resolve_edge_with_scores',
     )
-    response_object = EdgeDuplicate(**llm_response)
+    response_object = EdgeDuplicateWithScores(**llm_response)
     duplicate_facts = response_object.duplicate_facts
 
     # Validate duplicate_facts are in valid range for EXISTING FACTS
@@ -679,9 +724,31 @@ async def resolve_extracted_edge(
         existing_edges[i] for i in contradicted_facts if 0 <= i < len(existing_edges)
     ]
 
-    fact_type: str = response_object.fact_type
+    # Process type scores and apply threshold
+    fact_type: str = response_object.final_type
+    confidence: float = response_object.confidence
     candidate_type_names = set(edge_type_candidates or {})
     custom_type_names = custom_edge_type_names or set()
+
+    # Log type scores for debugging
+    if response_object.type_scores:
+        logger.debug(
+            'Edge type scores: %s',
+            [(ts.type_name, ts.score, ts.reasoning[:50] + '...' if len(ts.reasoning) > 50 else ts.reasoning)
+             for ts in response_object.type_scores],
+        )
+
+    # Apply threshold: if confidence < EDGE_TYPE_CONFIDENCE_THRESHOLD, use DEFAULT
+    if confidence < EDGE_TYPE_CONFIDENCE_THRESHOLD:
+        logger.info(
+            'Edge type "%s" confidence %.2f < threshold %.2f, defaulting to %s (reasoning: %s)',
+            fact_type,
+            confidence,
+            EDGE_TYPE_CONFIDENCE_THRESHOLD,
+            DEFAULT_EDGE_NAME,
+            response_object.final_reasoning,
+        )
+        fact_type = 'DEFAULT'
 
     is_default_type = fact_type.upper() == 'DEFAULT'
     is_custom_type = fact_type in custom_type_names

@@ -53,8 +53,34 @@ class ExtractedEdges(BaseModel):
     edges: list[Edge]
 
 
+class FactCorrection(BaseModel):
+    """Correction for a misextracted fact."""
+    original_fact: str = Field(..., description='The original fact text that needs correction')
+    issue: str = Field(
+        ...,
+        description='Type of issue: "wrong_relation_type", "wrong_direction", "nonexistent_relationship"'
+    )
+    corrected_relation_type: str | None = Field(
+        None,
+        description='The correct relation_type if issue is "wrong_relation_type"'
+    )
+    reason: str = Field(..., description='Brief explanation of why this fact is incorrect')
+
+
 class MissingFacts(BaseModel):
-    missing_facts: list[str] = Field(..., description="facts that weren't extracted")
+    missing_facts: list[str] = Field(
+        default_factory=list,
+        description="Facts that weren't extracted but should be"
+    )
+    facts_to_remove: list[str] = Field(
+        default_factory=list,
+        description='Facts that should be REMOVED because they are incorrect '
+        '(e.g., relationship does not exist, hallucinated, or misinterpreted)',
+    )
+    facts_to_correct: list[FactCorrection] = Field(
+        default_factory=list,
+        description='Facts with wrong relation_type or direction that need correction',
+    )
 
 
 class Prompt(Protocol):
@@ -146,7 +172,18 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 
 
 def reflexion(context: dict[str, Any]) -> list[Message]:
-    sys_prompt = """You are an AI assistant that determines which facts have not been extracted from the given context"""
+    sys_prompt = """You are an AI assistant that reviews fact/relationship extraction quality. You perform both:
+1. **Positive reflexion**: Identify facts that SHOULD have been extracted but weren't
+2. **Negative reflexion**: Identify facts that are INCORRECT and should be removed or corrected
+
+A fact should be REMOVED if:
+- The relationship does not actually exist between the entities
+- The fact was hallucinated or misinterpreted from the text
+- The fact is redundant with another extracted fact
+
+A fact should be CORRECTED if:
+- The relation_type is wrong (e.g., WORKS_AT instead of MANAGES)
+- The direction is reversed (source and target swapped)"""
 
     user_prompt = f"""
 <PREVIOUS MESSAGES>
@@ -164,8 +201,22 @@ def reflexion(context: dict[str, Any]) -> list[Message]:
 {context['extracted_facts']}
 </EXTRACTED FACTS>
 
-Given the above MESSAGES, list of EXTRACTED ENTITIES entities, and list of EXTRACTED FACTS; 
-determine if any facts haven't been extracted.
+Review the fact extraction quality and provide:
+
+1. **missing_facts**: Facts that should have been extracted but weren't
+   - Describe each missing fact in natural language
+
+2. **facts_to_remove**: Facts from EXTRACTED FACTS that should be REMOVED
+   - List the exact fact text that should be removed
+   - Only include facts that are clearly incorrect or hallucinated
+
+3. **facts_to_correct**: Facts with wrong relation_type or direction
+   - original_fact: the exact fact text
+   - issue: "wrong_relation_type" or "wrong_direction" or "nonexistent_relationship"
+   - corrected_relation_type: the correct type (only for wrong_relation_type)
+   - reason: why this correction is needed
+
+Return empty lists if the extraction quality is good.
 """
     return [
         Message(role='system', content=sys_prompt),

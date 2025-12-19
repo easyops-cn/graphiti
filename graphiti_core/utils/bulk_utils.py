@@ -63,6 +63,7 @@ from graphiti_core.prompts.dedupe_nodes import NodeResolutions
 from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes,
     resolve_extracted_nodes,
+    _collect_candidate_nodes,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,26 +81,32 @@ def _get_entity_type_label(node: EntityNode) -> str:
 
 async def _resolve_batch_with_llm(
     llm_client: LLMClient,
-    unresolved_nodes: list[EntityNode],
-    canonical_candidates: list[EntityNode],
+    nodes: list[EntityNode],
+    candidates: list[EntityNode],
     entity_types: dict[str, type[BaseModel]] | None,
 ) -> list[tuple[EntityNode, EntityNode]]:
-    """Use LLM to resolve semantic duplicates that deterministic matching missed.
+    """Use LLM to find semantic duplicates between nodes and candidates.
 
-    EasyOps customization: Enables batch-internal deduplication of semantic synonyms
-    like 'EasyITSM' vs 'IT服务中心' that cannot be matched by exact string or MinHash.
+    EasyOps customization: Compare extracted nodes against candidate nodes (not including self)
+    to find semantic duplicates that deterministic matching cannot handle.
+
+    Args:
+        llm_client: LLM client for generating responses
+        nodes: List of nodes to check (will be ENTITIES in prompt)
+        candidates: List of candidate nodes to compare against (will be EXISTING ENTITIES)
+        entity_types: Entity type definitions for context
 
     Returns:
-        List of (source_node, canonical_node) pairs for detected duplicates.
+        List of (source_node, canonical_node) tuples for detected duplicates.
     """
-    if not unresolved_nodes or not canonical_candidates:
+    if not nodes or not candidates:
         return []
 
     entity_types_dict = entity_types or {}
 
-    # Build context for extracted nodes (unresolved)
+    # Build ENTITIES context (nodes to check)
     extracted_nodes_context = []
-    for i, node in enumerate(unresolved_nodes):
+    for i, node in enumerate(nodes):
         entity_type_label = _get_entity_type_label(node)
         type_model = entity_types_dict.get(entity_type_label)
         extracted_nodes_context.append({
@@ -110,7 +117,7 @@ async def _resolve_batch_with_llm(
             'entity_type_description': type_model.__doc__ if type_model else 'Default Entity Type',
         })
 
-    # Build context for existing candidates (canonical pool)
+    # Build EXISTING ENTITIES context (candidates, not including the node itself)
     existing_nodes_context = [
         {
             'idx': i,
@@ -119,7 +126,7 @@ async def _resolve_batch_with_llm(
             'entity_types': candidate.labels,
             **candidate.attributes,
         }
-        for i, candidate in enumerate(canonical_candidates)
+        for i, candidate in enumerate(candidates)
     ]
 
     context = {
@@ -131,15 +138,14 @@ async def _resolve_batch_with_llm(
 
     logger.info(
         '[batch_dedup_llm] Sending %d nodes to LLM against %d candidates',
-        len(unresolved_nodes),
-        len(canonical_candidates),
+        len(nodes), len(candidates),
     )
 
     try:
         llm_response = await llm_client.generate_response(
             prompt_library.dedupe_nodes.nodes(context),
             response_model=NodeResolutions,
-            prompt_name='dedupe_nodes.nodes_batch',
+            prompt_name='dedupe_nodes.nodes_semantic',
         )
 
         node_resolutions = NodeResolutions(**llm_response).entity_resolutions
@@ -149,21 +155,22 @@ async def _resolve_batch_with_llm(
             node_id = resolution.id
             duplicate_idx = resolution.duplicate_idx
 
-            if node_id < 0 or node_id >= len(unresolved_nodes):
+            if node_id < 0 or node_id >= len(nodes):
                 continue
             if duplicate_idx == -1:
                 continue
-            if duplicate_idx < 0 or duplicate_idx >= len(canonical_candidates):
+            if duplicate_idx < 0 or duplicate_idx >= len(candidates):
                 continue
 
-            source_node = unresolved_nodes[node_id]
-            canonical_node = canonical_candidates[duplicate_idx]
+            source_node = nodes[node_id]
+            canonical_node = candidates[duplicate_idx]
 
             if source_node.uuid != canonical_node.uuid:
                 logger.info(
-                    '[batch_dedup_llm] Duplicate found: "%s" -> "%s"',
+                    '[batch_dedup_llm] Duplicate found: "%s" -> "%s", reasoning: %s',
                     source_node.name,
                     canonical_node.name,
+                    resolution.reasoning or 'no reasoning',
                 )
                 duplicate_pairs.append((source_node, canonical_node))
 
@@ -204,20 +211,29 @@ async def semantic_dedupe_nodes_bulk(
     clients: GraphitiClients,
     nodes: list[EntityNode],
     entity_types: dict[str, type[BaseModel]] | None = None,
-) -> list[EntityNode]:
+    db_candidates_by_type: dict[str, list[EntityNode]] | None = None,
+) -> tuple[list[EntityNode], dict[str, str]]:
     """Perform LLM-based semantic deduplication on hydrated nodes.
 
     EasyOps customization: Run after extract_attributes_from_nodes so that
     summary and attributes are available for LLM to make better decisions.
 
-    Groups nodes by entity type and uses LLM to identify semantic duplicates
-    (e.g., 'EasyITSM' vs 'IT服务中心') that deterministic matching cannot handle.
+    This function now handles BOTH batch-internal dedup AND database dedup in one pass,
+    replacing the previous two-pass approach (NodeResolutionsWithScores + NodeResolutions).
+
+    Args:
+        clients: GraphitiClients instance
+        nodes: List of extracted nodes to deduplicate
+        entity_types: Entity type definitions for context
+        db_candidates_by_type: Database candidates grouped by entity type (same type only)
 
     Returns:
-        Deduplicated list of nodes with merged summaries and attributes.
+        Tuple of (deduplicated nodes, uuid_map from duplicates to canonical).
     """
-    if len(nodes) < 2:
-        return nodes
+    if not nodes:
+        return nodes, {}
+
+    db_candidates_by_type = db_candidates_by_type or {}
 
     # Group nodes by entity type
     nodes_by_type: dict[str, list[EntityNode]] = {}
@@ -231,41 +247,92 @@ async def semantic_dedupe_nodes_bulk(
     duplicate_map: dict[str, str] = {}
     nodes_by_uuid: dict[str, EntityNode] = {node.uuid: node for node in nodes}
 
-    # For each entity type with multiple nodes, check for semantic duplicates
+    # Also track DB nodes by uuid for merging
+    db_nodes_by_uuid: dict[str, EntityNode] = {}
+    for db_nodes in db_candidates_by_type.values():
+        for db_node in db_nodes:
+            db_nodes_by_uuid[db_node.uuid] = db_node
+
+    # Collect all dedup tasks for parallel execution
+    dedup_tasks: list[tuple[EntityNode, list[EntityNode], str]] = []  # (node, candidates, entity_type)
+
     for entity_type, type_nodes in nodes_by_type.items():
-        if len(type_nodes) < 2:
-            continue
+        # Get DB candidates for this entity type
+        db_candidates = db_candidates_by_type.get(entity_type, [])
+        db_uuids = {c.uuid for c in db_candidates}
 
         logger.info(
-            '[semantic_dedup] Checking %d %s entities for semantic duplicates',
-            len(type_nodes), entity_type,
+            '[semantic_dedup] Preparing %d %s entities (db_candidates=%d)',
+            len(type_nodes), entity_type, len(db_candidates),
         )
 
-        # Check each node against others of same type
+        # For each node, build candidate list (batch-internal + DB)
         for i, node in enumerate(type_nodes):
-            if node.uuid in duplicate_map:
-                continue  # Already identified as duplicate
+            # Batch-internal candidates: subsequent nodes of same type
+            batch_candidates = [n for n in type_nodes[i + 1:]]
 
-            candidates = [n for n in type_nodes[i+1:] if n.uuid not in duplicate_map]
-            if not candidates:
-                continue
+            # DB candidates: exclude nodes already in batch (by uuid)
+            batch_uuids = {n.uuid for n in type_nodes}
+            filtered_db_candidates = [c for c in db_candidates if c.uuid not in batch_uuids]
 
-            llm_pairs = await _resolve_batch_with_llm(
-                clients.llm_client, [node], candidates, entity_types
-            )
+            # Merge candidates: batch-internal first, then DB
+            all_candidates = batch_candidates + filtered_db_candidates
 
-            for source, canonical in llm_pairs:
-                # Merge source into canonical
-                _merge_node_into_canonical(source, canonical)
-                duplicate_map[source.uuid] = canonical.uuid
+            if all_candidates:
+                dedup_tasks.append((node, all_candidates, entity_type))
+
+    if not dedup_tasks:
+        logger.info('[semantic_dedup] No dedup tasks to process')
+        return nodes, {}
+
+    logger.info('[semantic_dedup] Processing %d dedup tasks in parallel', len(dedup_tasks))
+
+    # Execute all LLM calls in parallel
+    async def process_dedup_task(
+        task: tuple[EntityNode, list[EntityNode], str]
+    ) -> list[tuple[EntityNode, EntityNode]]:
+        node, candidates, entity_type = task
+        return await _resolve_batch_with_llm(
+            clients.llm_client, [node], candidates, entity_types
+        )
+
+    all_results = await semaphore_gather(
+        *[process_dedup_task(task) for task in dedup_tasks]
+    )
+
+    # Process results: build duplicate_map
+    for llm_pairs in all_results:
+        for source_node, canonical_node in llm_pairs:
+            if source_node.uuid in duplicate_map:
+                continue  # Already processed
+
+            # Check if canonical is a DB node or batch node
+            is_db_canonical = canonical_node.uuid in db_nodes_by_uuid
+
+            if is_db_canonical:
+                # Merge into DB node (don't modify DB node, just track mapping)
+                duplicate_map[source_node.uuid] = canonical_node.uuid
+                logger.info(
+                    '[semantic_dedup] Merged "%s" into DB entity "%s"',
+                    source_node.name, canonical_node.name,
+                )
+            else:
+                # Merge into batch node
+                _merge_node_into_canonical(source_node, canonical_node)
+                duplicate_map[source_node.uuid] = canonical_node.uuid
                 logger.info(
                     '[semantic_dedup] Merged "%s" into "%s"',
-                    source.name, canonical.name,
+                    source_node.name, canonical_node.name,
                 )
 
-    # Return deduplicated nodes
+    # Return deduplicated nodes (excluding those mapped to duplicates)
     deduped_nodes = [node for node in nodes if node.uuid not in duplicate_map]
-    return deduped_nodes
+    if duplicate_map:
+        logger.info(
+            '[semantic_dedup] Completed: %d duplicates found, %d unique nodes remain',
+            len(duplicate_map), len(deduped_nodes),
+        )
+    return deduped_nodes, duplicate_map
 
 
 def _sanitize_string_for_falkordb(value: str) -> str:
@@ -445,6 +512,9 @@ async def add_nodes_and_edges_bulk_tx(
             'name_embedding': node.name_embedding,
             'labels': list(set(node.labels + ['Entity'])),
             'reasoning': reasoning,
+            # EasyOps: Save type classification scores (same as nodes.py save())
+            'type_scores': json.dumps(node.type_scores) if node.type_scores else None,
+            'type_confidence': node.type_confidence,
         }
 
         if driver.provider == GraphProvider.KUZU:
@@ -582,54 +652,69 @@ async def dedupe_nodes_bulk(
     extracted_nodes: list[list[EntityNode]],
     episode_tuples: list[tuple[EpisodicNode, list[EpisodicNode]]],
     entity_types: dict[str, type[BaseModel]] | None = None,
-) -> tuple[dict[str, list[EntityNode]], dict[str, str]]:
-    """Resolve entity duplicates across an in-memory batch using a two-pass strategy.
+) -> tuple[dict[str, list[EntityNode]], dict[str, str], dict[str, list[EntityNode]]]:
+    """Resolve entity duplicates across an in-memory batch using deterministic matching only.
 
-    1. Run :func:`resolve_extracted_nodes` for every episode in parallel so each batch item is
-       reconciled against the live graph just like the non-batch flow.
-    2. Re-run the deterministic similarity heuristics across the union of resolved nodes to catch
-       duplicates that only co-occur inside this batch, emitting a canonical UUID map that callers
-       can apply to edges and persistence.
+    EasyOps optimization: This function no longer uses LLM for deduplication.
+    It only performs:
+    1. Database search to collect existing candidates (filtered by entity type)
+    2. Deterministic matching (exact string + MinHash similarity)
+
+    LLM-based semantic deduplication is now handled by `semantic_dedupe_nodes_bulk`
+    which runs AFTER attributes extraction (so summary is available for better decisions).
+
+    Returns:
+        Tuple of:
+        - nodes_by_episode: Dict mapping episode UUID to deduplicated nodes
+        - compressed_map: UUID mapping from duplicates to canonical nodes
+        - db_candidates_by_type: Database candidates grouped by entity type (for semantic dedup)
     """
 
-    first_pass_results = await semaphore_gather(
+    # Step 1: Collect database candidates for all nodes (parallel)
+    # Each episode's nodes are searched against the database, filtered by entity type
+    all_extracted = [node for nodes in extracted_nodes for node in nodes]
+
+    db_search_results = await semaphore_gather(
         *[
-            resolve_extracted_nodes(
-                clients,
-                nodes,
-                episode_tuples[i][0],
-                episode_tuples[i][1],
-                entity_types,
-            )
-            for i, nodes in enumerate(extracted_nodes)
+            _collect_candidate_nodes(clients, nodes, None)
+            for nodes in extracted_nodes
         ]
     )
 
-    episode_resolutions: list[tuple[str, list[EntityNode]]] = []
-    per_episode_uuid_maps: list[dict[str, str]] = []
+    # Collect all DB candidates and group by entity type
+    db_candidates_by_type: dict[str, list[EntityNode]] = {}
+    seen_db_uuids: set[str] = set()
+
+    for candidates in db_search_results:
+        for candidate in candidates:
+            if candidate.uuid in seen_db_uuids:
+                continue
+            seen_db_uuids.add(candidate.uuid)
+
+            entity_type = _get_entity_type_label(candidate)
+            if entity_type not in db_candidates_by_type:
+                db_candidates_by_type[entity_type] = []
+            db_candidates_by_type[entity_type].append(candidate)
+
+    logger.info(
+        '[dedupe_nodes_bulk] Collected DB candidates: %s',
+        {k: len(v) for k, v in db_candidates_by_type.items()},
+    )
+
+    # Step 2: Deterministic matching within batch (exact string + MinHash)
     duplicate_pairs: list[tuple[str, str]] = []
-
-    for (resolved_nodes, uuid_map, duplicates), (episode, _) in zip(
-        first_pass_results, episode_tuples, strict=True
-    ):
-        episode_resolutions.append((episode.uuid, resolved_nodes))
-        per_episode_uuid_maps.append(uuid_map)
-        duplicate_pairs.extend((source.uuid, target.uuid) for source, target in duplicates)
-
     canonical_nodes: dict[str, EntityNode] = {}
-    for _, resolved_nodes in episode_resolutions:
-        for node in resolved_nodes:
-            # NOTE: this loop is O(n^2) in the number of nodes inside the batch because we rebuild
-            # the MinHash index for the accumulated canonical pool each time. The LRU-backed
-            # shingle cache keeps the constant factors low for typical batch sizes (≤ CHUNK_SIZE),
-            # but if batches grow significantly we should switch to an incremental index or chunked
-            # processing.
+
+    for nodes in extracted_nodes:
+        for node in nodes:
             if not canonical_nodes:
                 canonical_nodes[node.uuid] = node
                 continue
 
             existing_candidates = list(canonical_nodes.values())
             normalized = _normalize_string_exact(node.name)
+
+            # Exact string match
             exact_match = next(
                 (
                     candidate
@@ -643,6 +728,7 @@ async def dedupe_nodes_bulk(
                     duplicate_pairs.append((node.uuid, exact_match.uuid))
                 continue
 
+            # MinHash similarity match
             indexes = _build_candidate_indexes(existing_candidates)
             state = DedupResolutionState(
                 resolved_nodes=[None],
@@ -661,35 +747,50 @@ async def dedupe_nodes_bulk(
             if canonical_uuid != node.uuid:
                 duplicate_pairs.append((node.uuid, canonical_uuid))
 
-    union_pairs: list[tuple[str, str]] = []
-    for uuid_map in per_episode_uuid_maps:
-        union_pairs.extend(uuid_map.items())
-    union_pairs.extend(duplicate_pairs)
+    # Step 3: Also check against DB candidates (deterministic only)
+    for node in all_extracted:
+        if node.uuid in [p[0] for p in duplicate_pairs]:
+            continue  # Already a duplicate
 
-    compressed_map: dict[str, str] = _build_directed_uuid_map(union_pairs)
+        entity_type = _get_entity_type_label(node)
+        db_candidates = db_candidates_by_type.get(entity_type, [])
 
+        normalized = _normalize_string_exact(node.name)
+        for db_candidate in db_candidates:
+            if _normalize_string_exact(db_candidate.name) == normalized:
+                duplicate_pairs.append((node.uuid, db_candidate.uuid))
+                # Also add DB node to canonical_nodes for reference
+                canonical_nodes[db_candidate.uuid] = db_candidate
+                break
+
+    # Build compressed UUID map
+    compressed_map: dict[str, str] = _build_directed_uuid_map(duplicate_pairs)
+
+    # Build nodes_by_episode
     nodes_by_episode: dict[str, list[EntityNode]] = {}
-    for episode_uuid, resolved_nodes in episode_resolutions:
+    for i, (episode, _) in enumerate(episode_tuples):
         deduped_nodes: list[EntityNode] = []
         seen: set[str] = set()
-        for node in resolved_nodes:
+
+        for node in extracted_nodes[i]:
             canonical_uuid = compressed_map.get(node.uuid, node.uuid)
             if canonical_uuid in seen:
                 continue
             seen.add(canonical_uuid)
+
             canonical_node = canonical_nodes.get(canonical_uuid)
             if canonical_node is None:
-                logger.error(
-                    'Canonical node %s missing during batch dedupe; falling back to %s',
-                    canonical_uuid,
-                    node.uuid,
-                )
                 canonical_node = node
             deduped_nodes.append(canonical_node)
 
-        nodes_by_episode[episode_uuid] = deduped_nodes
+        nodes_by_episode[episode.uuid] = deduped_nodes
 
-    return nodes_by_episode, compressed_map
+    logger.info(
+        '[dedupe_nodes_bulk] Deterministic dedup: %d pairs found',
+        len(duplicate_pairs),
+    )
+
+    return nodes_by_episode, compressed_map, db_candidates_by_type
 
 
 async def dedupe_edges_bulk(

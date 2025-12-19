@@ -442,6 +442,14 @@ class EntityNode(Node):
         default=None,
         description='LLM reasoning for entity extraction and type classification (Chain of Thought)'
     )
+    type_scores: dict[str, Any] | None = Field(
+        default=None,
+        description='Type classification scores from LLM. Format: {type_name: {score: float, reasoning: str}}'
+    )
+    type_confidence: float | None = Field(
+        default=None,
+        description='Confidence score (0.0-1.0) for the final type classification'
+    )
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
@@ -490,6 +498,9 @@ class EntityNode(Node):
             'summary': self.summary,
             'created_at': self.created_at,
             'reasoning': self.reasoning,
+            # EasyOps: Save type classification scores
+            'type_scores': json.dumps(self.type_scores) if self.type_scores else None,
+            'type_confidence': self.type_confidence,
         }
 
         if driver.provider == GraphProvider.KUZU:
@@ -772,6 +783,19 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
     # Extract reasoning from attributes before removing it
     reasoning = attributes.pop('reasoning', None)
 
+    # EasyOps: Extract type classification scores from attributes
+    type_scores_raw = attributes.pop('type_scores', None)
+    type_scores = None
+    if type_scores_raw:
+        if isinstance(type_scores_raw, str):
+            try:
+                type_scores = json.loads(type_scores_raw)
+            except json.JSONDecodeError:
+                type_scores = None
+        elif isinstance(type_scores_raw, dict):
+            type_scores = type_scores_raw
+    type_confidence = attributes.pop('type_confidence', None)
+
     labels = record.get('labels', [])
     group_id = record.get('group_id')
     if 'Entity_' + group_id.replace('-', '') in labels:
@@ -787,6 +811,8 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         summary=record['summary'],
         attributes=attributes,
         reasoning=reasoning,
+        type_scores=type_scores,
+        type_confidence=type_confidence,
     )
 
     return entity_node

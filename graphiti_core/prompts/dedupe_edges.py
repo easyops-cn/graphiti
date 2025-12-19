@@ -46,6 +46,56 @@ class EdgeDuplicate(BaseModel):
     )
 
 
+# Scoring-based edge type classification models
+class EdgeTypeScore(BaseModel):
+    """Score for a single edge type candidate."""
+    type_name: str = Field(..., description='Name of the edge type being scored')
+    score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description='Confidence score from 0.0 to 1.0. 1.0 = perfect match, 0.0 = definitely not this type',
+    )
+    reasoning: str = Field(
+        ...,
+        description='Brief explanation of why this score was given',
+    )
+
+
+class EdgeDuplicateWithScores(BaseModel):
+    """Edge deduplication result with type scores."""
+    duplicate_facts: list[int] = Field(
+        ...,
+        description='List of idx values of any duplicate facts. If no duplicate facts are found, default to empty list.',
+    )
+    merged_fact: str | None = Field(
+        default=None,
+        description='When duplicate_facts is not empty, provide a merged fact. Return null if no duplicates.',
+    )
+    contradicted_facts: list[int] = Field(
+        ...,
+        description='List of idx values of facts that should be invalidated.',
+    )
+    type_scores: list[EdgeTypeScore] = Field(
+        ...,
+        description='Scores for each edge type candidate. Must include a score for EVERY type in FACT TYPES.',
+    )
+    final_type: str = Field(
+        ...,
+        description='The edge type with the highest score, or DEFAULT if no type matched well',
+    )
+    final_reasoning: str = Field(
+        ...,
+        description='Summary reasoning for the final type selection',
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description='Confidence in the final type classification (0.0-1.0)',
+    )
+
+
 class UniqueFact(BaseModel):
     uuid: str = Field(..., description='unique identifier of the fact')
     fact: str = Field(..., description='fact of a unique edge')
@@ -59,12 +109,14 @@ class Prompt(Protocol):
     edge: PromptVersion
     edge_list: PromptVersion
     resolve_edge: PromptVersion
+    resolve_edge_with_scores: PromptVersion
 
 
 class Versions(TypedDict):
     edge: PromptFunction
     edge_list: PromptFunction
     resolve_edge: PromptFunction
+    resolve_edge_with_scores: PromptFunction
 
 
 def edge(context: dict[str, Any]) -> list[Message]:
@@ -198,4 +250,84 @@ def resolve_edge(context: dict[str, Any]) -> list[Message]:
     ]
 
 
-versions: Versions = {'edge': edge, 'edge_list': edge_list, 'resolve_edge': resolve_edge}
+def resolve_edge_with_scores(context: dict[str, Any]) -> list[Message]:
+    """Resolve edge with type scoring for more deliberate classification.
+
+    This version requires the LLM to score ALL edge types,
+    forcing careful comparison before making a classification decision.
+    """
+    return [
+        Message(
+            role='system',
+            content='You are a helpful assistant that de-duplicates facts, determines contradictions, '
+            'and classifies fact types by SCORING each type candidate. '
+            'You must evaluate and score EVERY type before making a decision.',
+        ),
+        Message(
+            role='user',
+            content=f"""
+        Task:
+        You will receive TWO separate lists of facts. Each list uses 'idx' as its index field, starting from 0.
+
+        1. DUPLICATE DETECTION:
+           - If the NEW FACT represents identical or semantically equivalent factual information as any fact in EXISTING FACTS, return those idx values in duplicate_facts.
+           - Facts expressing the same relationship with different wording (e.g., different languages, different phrasing) ARE duplicates.
+           - Facts with similar information that contain key differences (different values, different targets) should NOT be marked as duplicates.
+           - Return idx values from EXISTING FACTS.
+           - If no duplicates, return an empty list for duplicate_facts.
+
+        2. FACT MERGING (Required when duplicates found):
+           - When duplicate_facts is NOT empty, you MUST provide merged_fact.
+           - merged_fact should combine the semantic meaning of BOTH the NEW FACT and the EXISTING FACT(s).
+           - If no duplicates, set merged_fact to null.
+
+        3. **FACT TYPE CLASSIFICATION WITH SCORING**:
+           - Given the predefined FACT TYPES, you MUST SCORE the NEW FACT against EVERY type.
+           - **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each fact type description.
+           - For EACH type in FACT TYPES, provide:
+             - type_name: The name of the edge type
+             - score: Confidence score from 0.0 to 1.0
+             - reasoning: Brief explanation of why this score was given
+
+           **SCORING GUIDELINES**:
+           - Score 0.9-1.0: Perfect match - fact clearly fits the IS examples
+           - Score 0.6-0.8: Good match - fact likely fits this type
+           - Score 0.3-0.5: Partial match - some characteristics but uncertain
+           - Score 0.0-0.2: Poor match - fact fits the IS NOT examples or doesn't match
+
+           - Set final_type to the type_name with the highest score, or DEFAULT if the highest score < 0.6
+           - Provide final_reasoning explaining your final decision
+           - Set confidence to your confidence in the final decision (0.0-1.0)
+
+        4. CONTRADICTION DETECTION:
+           - Based on FACT INVALIDATION CANDIDATES and NEW FACT, determine which facts the new fact contradicts.
+           - Return idx values from FACT INVALIDATION CANDIDATES.
+           - If no contradictions, return an empty list for contradicted_facts.
+
+        IMPORTANT:
+        - duplicate_facts: Use ONLY 'idx' values from EXISTING FACTS
+        - contradicted_facts: Use ONLY 'idx' values from FACT INVALIDATION CANDIDATES
+        - type_scores: MUST include a score for EVERY type in FACT TYPES
+        - merged_fact is REQUIRED when duplicate_facts is not empty
+
+        <FACT TYPES>
+        {context['edge_types']}
+        </FACT TYPES>
+
+        <EXISTING FACTS>
+        {context['existing_edges']}
+        </EXISTING FACTS>
+
+        <FACT INVALIDATION CANDIDATES>
+        {context['edge_invalidation_candidates']}
+        </FACT INVALIDATION CANDIDATES>
+
+        <NEW FACT>
+        {context['new_edge']}
+        </NEW FACT>
+        """,
+        ),
+    ]
+
+
+versions: Versions = {'edge': edge, 'edge_list': edge_list, 'resolve_edge': resolve_edge, 'resolve_edge_with_scores': resolve_edge_with_scores}

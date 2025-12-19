@@ -46,16 +46,68 @@ class NodeResolutions(BaseModel):
     entity_resolutions: list[NodeDuplicate] = Field(..., description='List of resolved nodes')
 
 
+# Scoring-based deduplication models
+class CandidateMatch(BaseModel):
+    """Score for a single candidate match."""
+    candidate_idx: int = Field(..., description='Index of the candidate entity in EXISTING ENTITIES')
+    similarity_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description='Similarity score from 0.0 to 1.0. 1.0 = definitely same entity, 0.0 = definitely different',
+    )
+    is_same_entity: bool = Field(
+        ...,
+        description='Whether this candidate refers to the same real-world entity',
+    )
+    reasoning: str = Field(
+        ...,
+        description='Brief explanation of the similarity assessment',
+    )
+
+
+class NodeDuplicateWithScores(BaseModel):
+    """Entity deduplication result with similarity scores."""
+    id: int = Field(..., description='integer id of the entity from ENTITIES')
+    name: str = Field(
+        ...,
+        description='Best name for the entity',
+    )
+    candidate_scores: list[CandidateMatch] = Field(
+        ...,
+        description='Similarity scores for each candidate in EXISTING ENTITIES that was evaluated',
+    )
+    best_match_idx: int = Field(
+        ...,
+        description='Index of the best matching candidate (highest score with is_same_entity=true), or -1 if no match',
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description='Confidence in the final deduplication decision (0.0-1.0)',
+    )
+
+
+class NodeResolutionsWithScores(BaseModel):
+    """Collection of scored entity deduplication results."""
+    entity_resolutions: list[NodeDuplicateWithScores] = Field(
+        ..., description='List of resolved nodes with scores'
+    )
+
+
 class Prompt(Protocol):
     node: PromptVersion
     node_list: PromptVersion
     nodes: PromptVersion
+    nodes_with_scores: PromptVersion
 
 
 class Versions(TypedDict):
     node: PromptFunction
     node_list: PromptFunction
     nodes: PromptFunction
+    nodes_with_scores: PromptFunction
 
 
 def node(context: dict[str, Any]) -> list[Message]:
@@ -86,7 +138,7 @@ def node(context: dict[str, Any]) -> list[Message]:
         
         Given the above EXISTING ENTITIES and their attributes, MESSAGE, and PREVIOUS MESSAGES; Determine if the NEW ENTITY extracted from the conversation
         is a duplicate entity of one of the EXISTING ENTITIES.
-        
+
         Entities should only be considered duplicates if they refer to the *same real-world object or concept*.
         Semantic Equivalence: if a descriptive label in existing_entities clearly refers to a named entity in context, treat them as duplicates.
 
@@ -197,8 +249,8 @@ def nodes(context: dict[str, Any]) -> list[Message]:
         - Only use idx values that appear in EXISTING ENTITIES.
         - Set duplicate_idx to the smallest idx you collected for that entity, or -1 if duplicates is empty.
         - Never fabricate entities or indices.
-        - When marking as duplicate, explain what evidence shows they refer to the same real-world object.
-        - When NOT marking as duplicate, you may leave reasoning empty or briefly explain why they are distinct.
+        - When marking as duplicate, explain what evidence shows they refer to the EXACT same real-world object.
+        - Default to -1 (no duplicate) when the entities are merely related but could be distinct.
         """,
         ),
     ]
@@ -241,4 +293,102 @@ def node_list(context: dict[str, Any]) -> list[Message]:
     ]
 
 
-versions: Versions = {'node': node, 'node_list': node_list, 'nodes': nodes}
+def nodes_with_scores(context: dict[str, Any]) -> list[Message]:
+    """Deduplication with similarity scoring for each candidate match.
+
+    This version requires the LLM to score ALL candidate entities,
+    forcing careful comparison before making a deduplication decision.
+    """
+    # Build entity type definitions section if available
+    type_defs = context.get('entity_type_definitions', {})
+    type_defs_section = ''
+    if type_defs:
+        type_defs_section = f"""
+        <ENTITY TYPE DEFINITIONS>
+        {to_prompt_json(type_defs)}
+        </ENTITY TYPE DEFINITIONS>
+        """
+
+    return [
+        Message(
+            role='system',
+            content='You are a helpful assistant that determines whether ENTITIES are duplicates '
+            'of existing entities by SCORING each candidate match. '
+            'You must evaluate and score EVERY candidate before making a decision.',
+        ),
+        Message(
+            role='user',
+            content=f"""
+        <PREVIOUS MESSAGES>
+        {to_prompt_json([ep for ep in context['previous_episodes']])}
+        </PREVIOUS MESSAGES>
+        <CURRENT MESSAGE>
+        {context['episode_content']}
+        </CURRENT MESSAGE>
+
+        {type_defs_section}
+
+        Each of the following ENTITIES were extracted from the CURRENT MESSAGE.
+        Each entity in ENTITIES is represented as a JSON object with the following structure:
+        {{
+            id: integer id of the entity,
+            name: "name of the entity",
+            entity_type: ["Entity", "<optional additional label>", ...]
+        }}
+
+        <ENTITIES>
+        {to_prompt_json(context['extracted_nodes'])}
+        </ENTITIES>
+
+        <EXISTING ENTITIES>
+        {to_prompt_json(context['existing_nodes'])}
+        </EXISTING ENTITIES>
+
+        Each entry in EXISTING ENTITIES is an object with the following structure:
+        {{
+            idx: integer index of the candidate entity (use this when referencing a duplicate),
+            name: "name of the candidate entity",
+            entity_types: ["Entity", "<optional additional label>", ...],
+            ...<additional attributes such as summaries or metadata>
+        }}
+
+        **TASK**: For each entity in ENTITIES, SCORE its similarity against EACH candidate in EXISTING ENTITIES.
+
+        **SCORING GUIDELINES**:
+        - Score 0.9-1.0: Definitely the same entity - same name, same context, same meaning
+        - Score 0.7-0.8: Very likely the same entity - minor name variations, clear semantic equivalence
+        - Score 0.4-0.6: Possibly related - similar names or concepts but could be different instances
+        - Score 0.1-0.3: Unlikely the same - related domain but different entities
+        - Score 0.0: Definitely different entities
+
+        **IMPORTANT RULES**:
+        - Entities should only be considered duplicates if they refer to the *same real-world object or concept*
+        - Do NOT merge entities that are merely related but distinct
+        - Do NOT merge entities with similar names but different contexts
+        - When in doubt, score lower and set is_same_entity=false
+
+        **OUTPUT FORMAT**:
+        For each entity in ENTITIES (IDs 0 through {len(context['extracted_nodes']) - 1}), return:
+        {{
+            "id": integer id from ENTITIES,
+            "name": the best full name for the entity,
+            "candidate_scores": [
+                {{
+                    "candidate_idx": idx from EXISTING ENTITIES,
+                    "similarity_score": float from 0.0 to 1.0,
+                    "is_same_entity": boolean - true only if you are confident they are the SAME entity,
+                    "reasoning": brief explanation of the similarity assessment
+                }}
+                // Include an entry for EVERY candidate in EXISTING ENTITIES
+            ],
+            "best_match_idx": idx of the best matching candidate (highest score where is_same_entity=true), or -1 if no match,
+            "confidence": your confidence in the final decision (0.0-1.0)
+        }}
+
+        Your response MUST include EXACTLY {len(context['extracted_nodes'])} resolutions with IDs 0 through {len(context['extracted_nodes']) - 1}.
+        """,
+        ),
+    ]
+
+
+versions: Versions = {'node': node, 'node_list': node_list, 'nodes': nodes, 'nodes_with_scores': nodes_with_scores}

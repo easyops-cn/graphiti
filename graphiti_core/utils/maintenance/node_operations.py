@@ -32,13 +32,27 @@ from graphiti_core.nodes import (
     create_entity_node_embeddings,
 )
 from graphiti_core.prompts import prompt_library
-from graphiti_core.prompts.dedupe_nodes import NodeDuplicate, NodeResolutions
+from graphiti_core.prompts.dedupe_nodes import (
+    NodeDuplicate,
+    NodeDuplicateWithScores,
+    NodeResolutions,
+    NodeResolutionsWithScores,
+)
 from graphiti_core.prompts.extract_nodes import (
-    EntitiesToFilter,
+    CandidateTypeScore,
+    EntityReclassification,
+    EntitySummaries,
     EntitySummary,
+    EntitySummaryItem,
+    EntityValidationResult,
     ExtractedEntities,
+    ExtractedEntitiesWithScores,
     ExtractedEntity,
+    ExtractedEntityWithScores,
     MissedEntities,
+    ResolvedEntityTypes,
+    TopTypeCandidate,
+    TypeScore,
 )
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
@@ -60,6 +74,14 @@ logger = logging.getLogger(__name__)
 
 NodeSummaryFilter = Callable[[EntityNode], Awaitable[bool]]
 
+# Threshold for deduplication similarity score
+# If the best match score is below this threshold, treat as no duplicate
+DEDUP_SIMILARITY_THRESHOLD = 0.7
+
+# EasyOps: Batch size for summary extraction
+# Process multiple entities in a single LLM call to reduce API calls
+SUMMARY_BATCH_SIZE = 10
+
 
 async def extract_nodes_reflexion(
     llm_client: LLMClient,
@@ -67,12 +89,21 @@ async def extract_nodes_reflexion(
     previous_episodes: list[EpisodicNode],
     node_names: list[str],
     group_id: str | None = None,
-) -> list[str]:
+    entity_types_context: list[dict] | None = None,
+) -> MissedEntities:
+    """Perform reflexion on extracted entities - both positive and negative.
+
+    Returns MissedEntities with:
+    - missed_entities: entities that should have been extracted
+    - entities_to_remove: entities that should NOT have been extracted
+    - entities_to_reclassify: entities with wrong type classification
+    """
     # Prepare context for LLM
     context = {
         'episode_content': episode.content,
         'previous_episodes': [ep.content for ep in previous_episodes],
         'extracted_entities': node_names,
+        'entity_types': entity_types_context or [],
     }
 
     llm_response = await llm_client.generate_response(
@@ -81,9 +112,8 @@ async def extract_nodes_reflexion(
         group_id=group_id,
         prompt_name='extract_nodes.reflexion',
     )
-    missed_entities = llm_response.get('missed_entities', [])
 
-    return missed_entities
+    return MissedEntities(**llm_response)
 
 
 async def filter_extracted_nodes(
@@ -92,64 +122,175 @@ async def filter_extracted_nodes(
     nodes: list[EntityNode],
     group_id: str | None = None,
     entity_types_context: list[dict] | None = None,
-) -> list[str]:
-    """Filter out entities that don't meet knowledge graph quality standards.
+) -> tuple[list[str], list[EntityReclassification]]:
+    """Filter out entities using a two-step validation approach.
 
-    Uses the Knowledge Graph Builder's Principles to identify and remove:
-    - Entities without lasting value (Permanence)
-    - Entities that can't connect meaningfully (Connectivity)
-    - Entities that aren't self-explanatory (Independence)
-    - Document artifacts instead of domain knowledge (Domain Value)
+    This approach reduces LLM attention issues by:
+    - Step 1: Validate each entity against ONLY its assigned type definition (focused attention)
+    - Step 2: For invalid entities only, provide ALL type definitions for reclassification
 
-    If entity_types_context is provided, entities matching valid types will be preserved.
+    The episode content is NOT passed - only entity name, summary, and type definition are used.
+    This reduces context size and helps LLM focus on the validation task.
 
     Args:
         llm_client: LLM client for generating responses
-        episode: The source episode
+        episode: The source episode (used for group_id only)
         nodes: List of EntityNode objects (with summary if available)
         group_id: Optional group ID
-        entity_types_context: Optional list of entity type definitions from schema
+        entity_types_context: List of entity type definitions from schema
+            Each dict should have: entity_type_id, entity_type_name, entity_type_description
 
     Returns:
-        List of entity names that should be removed
+        Tuple of (entities_to_remove, entities_to_reclassify)
+        - entities_to_remove: List of entity names that should be removed
+        - entities_to_reclassify: List of EntityReclassification objects for type correction
     """
     if not nodes:
-        return []
+        return [], []
 
-    # Build entity info with summary for better filtering decisions
-    entities_info = []
+    # Build type definition lookup
+    type_definitions: dict[str, str] = {}
+    if entity_types_context:
+        for et in entity_types_context:
+            type_name = et.get('entity_type_name', '')
+            type_desc = et.get('entity_type_description', '')
+            if type_name and type_desc:
+                type_definitions[type_name] = type_desc
+
+    # Step 1: Validate each entity against its assigned type
+    # Build entity info with type definition for validation
+    entities_for_validation = []
     for node in nodes:
-        info = {'name': node.name}
-        if node.summary:
-            info['summary'] = node.summary
-        # Include entity type for context
-        specific_type = next((l for l in node.labels if l != 'Entity'), None)
-        if specific_type:
-            info['type'] = specific_type
-        entities_info.append(info)
+        specific_type = next((l for l in node.labels if l != 'Entity'), None) or 'Entity'
+        type_def = type_definitions.get(specific_type, '')
 
-    context = {
-        'episode_content': episode.content,
-        'extracted_entities': entities_info,
-        'entity_types': entity_types_context,
-    }
+        entities_for_validation.append({
+            'name': node.name,
+            'summary': node.summary or '',
+            'assigned_type': specific_type,
+            'type_definition': type_def,
+        })
 
-    llm_response = await llm_client.generate_response(
-        prompt_library.extract_nodes.filter_entities(context),
-        EntitiesToFilter,
-        group_id=group_id,
-        prompt_name='extract_nodes.filter_entities',
+    # Batch processing: 5 entities per batch, parallel execution
+    BATCH_SIZE = 5
+    batches = [
+        entities_for_validation[i : i + BATCH_SIZE]
+        for i in range(0, len(entities_for_validation), BATCH_SIZE)
+    ]
+
+    async def validate_batch(batch: list[dict]) -> list[tuple[str, bool, str]]:
+        """Validate a batch of entities. Returns list of (name, is_valid, reason)."""
+        context = {'entities': batch}
+        llm_response = await llm_client.generate_response(
+            prompt_library.extract_nodes.validate_entity_types(context),
+            EntityValidationResult,
+            group_id=group_id,
+            prompt_name='extract_nodes.validate_entity_types',
+        )
+        result = EntityValidationResult(**llm_response)
+        return [(v.name, v.is_valid, v.reason) for v in result.validations]
+
+    # Run validation batches in parallel
+    validation_results: list[list[tuple[str, bool, str]]] = await semaphore_gather(
+        *[validate_batch(batch) for batch in batches]
     )
 
-    entities_to_remove = llm_response.get('entities_to_remove', [])
-    reasoning = llm_response.get('reasoning', '')
+    # Collect invalid entities
+    invalid_entities: list[dict] = []  # {name, summary, assigned_type, reason}
+    for batch_results in validation_results:
+        for name, is_valid, reason in batch_results:
+            if not is_valid:
+                # Find the original entity info
+                entity_info = next(
+                    (e for e in entities_for_validation if e['name'] == name), None
+                )
+                if entity_info:
+                    invalid_entities.append({
+                        'name': name,
+                        'summary': entity_info['summary'],
+                        'assigned_type': entity_info['assigned_type'],
+                        'validation_reason': reason,
+                    })
+                    logger.info(
+                        f'[filter_step1] Entity "{name}" failed validation for type '
+                        f'"{entity_info["assigned_type"]}": {reason}'
+                    )
 
-    if entities_to_remove:
-        logger.info(
-            f'Filtering {len(entities_to_remove)} entities: {entities_to_remove}. Reason: {reasoning}'
+    if not invalid_entities:
+        logger.info('[filter] All entities passed type validation')
+        return [], []
+
+    # Step 2: Reclassify invalid entities using the production-validated extract_text prompt
+    # For each invalid entity, use its name+summary as "text" and let LLM re-classify
+    entities_to_remove: list[str] = []
+    entities_to_reclassify: list[EntityReclassification] = []
+
+    async def reclassify_entity(entity: dict) -> tuple[str, str | None, str]:
+        """Reclassify a single entity using extract_text prompt.
+
+        Returns: (name, new_type or None, reasoning)
+        """
+        # EasyOps fix: Use full episode content for reclassification context
+        # instead of just name+summary, to preserve critical context
+        reclassify_context = {
+            'episode_content': episode.content,  # Full episode context
+            'entity_types': entity_types_context,  # Full schema types
+            # NOTE: Do NOT include validation_reason here - it may contain type suggestions
+            # that would bias the LLM. Let extract_text make an independent classification.
+            'custom_prompt': f"Focus on the entity '{entity['name']}' (description: {entity['summary']}). "
+                           f"It was previously classified as '{entity['assigned_type']}' "
+                           f"but that classification may be incorrect. "
+                           f"Re-read the full episode content and determine the correct entity type "
+                           f"from the available types based on how '{entity['name']}' is described in context.",
+        }
+
+        llm_response = await llm_client.generate_response(
+            prompt_library.extract_nodes.extract_text(reclassify_context),
+            ExtractedEntities,
+            group_id=group_id,
+            prompt_name='extract_nodes.extract_text_reclassify',
         )
 
-    return entities_to_remove
+        result = ExtractedEntities(**llm_response)
+
+        if not result.extracted_entities:
+            # LLM didn't extract anything - entity should be removed
+            return entity['name'], None, 'No valid entity type found during reclassification'
+
+        # Get the first extracted entity's classification
+        extracted = result.extracted_entities[0]
+        type_id = extracted.entity_type_id
+        reasoning = extracted.reasoning if hasattr(extracted, 'reasoning') else ''
+
+        # Map type_id back to type name
+        if 0 <= type_id < len(entity_types_context):
+            new_type_name = entity_types_context[type_id].get('entity_type_name', 'Entity')
+        else:
+            new_type_name = 'Entity'
+
+        # If still Entity or same as failed type, remove it
+        if new_type_name == 'Entity' or new_type_name == entity['assigned_type']:
+            return entity['name'], None, f'Reclassified as {new_type_name}, still invalid. {reasoning}'
+
+        return entity['name'], new_type_name, reasoning
+
+    # Run reclassification in parallel
+    reclassify_results = await semaphore_gather(
+        *[reclassify_entity(entity) for entity in invalid_entities]
+    )
+
+    # Process results
+    for name, new_type, reasoning in reclassify_results:
+        if new_type is None:
+            entities_to_remove.append(name)
+            logger.info(f'[filter_step2] Removing "{name}": {reasoning}')
+        else:
+            entities_to_reclassify.append(
+                EntityReclassification(name=name, new_type=new_type, reason=reasoning)
+            )
+            logger.info(f'[filter_step2] Reclassifying "{name}" to "{new_type}": {reasoning}')
+
+    return entities_to_remove, entities_to_reclassify
 
 
 async def extract_nodes(
@@ -159,6 +300,16 @@ async def extract_nodes(
     entity_types: dict[str, type[BaseModel]] | None = None,
     excluded_entity_types: list[str] | None = None,
 ) -> list[EntityNode]:
+    """Extract entities from episode content with type scoring.
+
+    Uses scoring-based prompts that require LLM to evaluate all type options,
+    ensuring deliberate classification decisions.
+
+    Type confidence threshold: 0.6
+    - If max score < 0.6, entity is classified as 'Entity' (default type)
+    """
+    TYPE_CONFIDENCE_THRESHOLD = 0.6
+
     start = time()
     perf_logger = logging.getLogger('graphiti.performance')
     llm_client = clients.llm_client
@@ -200,21 +351,23 @@ async def extract_nodes(
 
     while entities_missed and reflexion_iterations <= MAX_REFLEXION_ITERATIONS:
         llm_start = time()
+        # Use scoring versions of prompts for deliberate classification
         if episode.source == EpisodeType.message:
             llm_response = await llm_client.generate_response(
-                prompt_library.extract_nodes.extract_message(context),
-                response_model=ExtractedEntities,
+                prompt_library.extract_nodes.extract_message_with_scores(context),
+                response_model=ExtractedEntitiesWithScores,
                 group_id=episode.group_id,
-                prompt_name='extract_nodes.extract_message',
+                prompt_name='extract_nodes.extract_message_with_scores',
             )
         elif episode.source == EpisodeType.text:
             llm_response = await llm_client.generate_response(
-                prompt_library.extract_nodes.extract_text(context),
-                response_model=ExtractedEntities,
+                prompt_library.extract_nodes.extract_text_with_scores(context),
+                response_model=ExtractedEntitiesWithScores,
                 group_id=episode.group_id,
-                prompt_name='extract_nodes.extract_text',
+                prompt_name='extract_nodes.extract_text_with_scores',
             )
         elif episode.source == EpisodeType.json:
+            # JSON extraction uses original prompt (scoring not needed for structured data)
             llm_response = await llm_client.generate_response(
                 prompt_library.extract_nodes.extract_json(context),
                 response_model=ExtractedEntities,
@@ -224,43 +377,162 @@ async def extract_nodes(
         llm_call_count += 1
         perf_logger.info(f'[PERF]     └─ extract_nodes LLM call #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
-        response_object = ExtractedEntities(**llm_response)
-
-        extracted_entities: list[ExtractedEntity] = response_object.extracted_entities
+        # Handle both scored and non-scored responses
+        if episode.source == EpisodeType.json:
+            response_object = ExtractedEntities(**llm_response)
+            extracted_entities = response_object.extracted_entities
+        else:
+            response_object = ExtractedEntitiesWithScores(**llm_response)
+            extracted_entities = response_object.extracted_entities
 
         reflexion_iterations += 1
         if reflexion_iterations < MAX_REFLEXION_ITERATIONS:
             llm_start = time()
-            missing_entities = await extract_nodes_reflexion(
+            reflexion_result = await extract_nodes_reflexion(
                 llm_client,
                 episode,
                 previous_episodes,
                 [entity.name for entity in extracted_entities],
                 episode.group_id,
+                entity_types_context,
             )
             llm_call_count += 1
             perf_logger.info(f'[PERF]     └─ extract_nodes reflexion #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
-            entities_missed = len(missing_entities) != 0
+            # Handle negative reflexion: remove entities that shouldn't have been extracted
+            if reflexion_result.entities_to_remove:
+                entities_to_remove_set = set(reflexion_result.entities_to_remove)
+                original_count = len(extracted_entities)
+                extracted_entities = [
+                    e for e in extracted_entities if e.name not in entities_to_remove_set
+                ]
+                logger.info(
+                    f'Negative reflexion removed {original_count - len(extracted_entities)} entities: '
+                    f'{reflexion_result.entities_to_remove}'
+                )
+
+            # Handle reclassification: update entity types
+            if reflexion_result.entities_to_reclassify:
+                reclassify_map = {r.name: r.new_type for r in reflexion_result.entities_to_reclassify}
+                # Find the type_id for each new_type
+                type_name_to_id = {
+                    et.get('entity_type_name'): i
+                    for i, et in enumerate(entity_types_context)
+                }
+                for entity in extracted_entities:
+                    if entity.name in reclassify_map:
+                        new_type = reclassify_map[entity.name]
+                        new_type_id = type_name_to_id.get(new_type)
+                        if new_type_id is not None:
+                            # Update the entity_type_id for ExtractedEntityWithScores
+                            if hasattr(entity, 'final_type_id'):
+                                entity.final_type_id = new_type_id
+                            elif hasattr(entity, 'entity_type_id'):
+                                entity.entity_type_id = new_type_id
+                            logger.info(f'Reclassified entity "{entity.name}" to type "{new_type}"')
+
+            # Handle positive reflexion: add missed entities to next extraction
+            entities_missed = len(reflexion_result.missed_entities) != 0
 
             custom_prompt = 'Make sure that the following entities are extracted: '
-            for entity in missing_entities:
+            for entity in reflexion_result.missed_entities:
                 custom_prompt += f'\n{entity},'
 
     filtered_extracted_entities = [entity for entity in extracted_entities if entity.name.strip()]
     end = time()
     logger.debug(f'Extracted new nodes: {filtered_extracted_entities} in {(end - start) * 1000} ms')
     perf_logger.info(f'[PERF]   └─ extract_nodes TOTAL: {(end - start)*1000:.0f}ms, entities={len(filtered_extracted_entities)}, llm_calls={llm_call_count}')
-    # Convert the extracted data into EntityNode objects
+
+    # Threshold for ambiguous type resolution (multiple high-confidence candidates)
+    AMBIGUOUS_SCORE_THRESHOLD = 0.7
+    # Minimum score gap between top 1 and top 2 to skip second-pass
+    # If top1 - top2 >= this value, we trust the first-pass result
+    AMBIGUOUS_SCORE_GAP_THRESHOLD = 0.15
+
+    # First pass: Convert extracted data to EntityNode objects
+    # Track entities that need second-pass resolution (multiple candidates >= 0.7 AND close scores)
     extracted_nodes = []
-    for extracted_entity in filtered_extracted_entities:
-        type_id = extracted_entity.entity_type_id
-        if 0 <= type_id < len(entity_types_context):
-            entity_type_name = entity_types_context[extracted_entity.entity_type_id].get(
-                'entity_type_name'
-            )
+    ambiguous_entities: list[tuple[int, ExtractedEntityWithScores, list[TopTypeCandidate]]] = []
+
+    for idx, extracted_entity in enumerate(filtered_extracted_entities):
+        # Handle scored entities (top 3 candidates)
+        if isinstance(extracted_entity, ExtractedEntityWithScores):
+            # Build type_scores dict for storage from top_candidates
+            type_scores_dict = {}
+            max_score = 0.0
+            high_score_candidates: list[TopTypeCandidate] = []
+
+            for tc in extracted_entity.top_candidates:
+                if 0 <= tc.type_id < len(entity_types_context):
+                    type_name = entity_types_context[tc.type_id].get('entity_type_name', 'Entity')
+                    type_scores_dict[type_name] = {
+                        'score': tc.score,
+                        'reasoning': tc.reasoning,
+                    }
+                    if tc.score > max_score:
+                        max_score = tc.score
+                    # Track high-score candidates for potential second-pass resolution
+                    if tc.score >= AMBIGUOUS_SCORE_THRESHOLD:
+                        high_score_candidates.append(tc)
+
+            # Apply threshold: if max score < 0.6, use Entity type
+            if max_score < TYPE_CONFIDENCE_THRESHOLD:
+                entity_type_name = 'Entity'
+                type_confidence = max_score
+                logger.info(
+                    f'Entity "{extracted_entity.name}" max score {max_score:.2f} < threshold {TYPE_CONFIDENCE_THRESHOLD}, '
+                    f'defaulting to Entity type'
+                )
+                reasoning = f'Low confidence ({max_score:.2f}), defaulted to Entity'
+            else:
+                type_id = extracted_entity.final_type_id
+                if 0 <= type_id < len(entity_types_context):
+                    entity_type_name = entity_types_context[type_id].get('entity_type_name', 'Entity')
+                else:
+                    entity_type_name = 'Entity'
+                type_confidence = max_score
+
+                # Check if this entity needs second-pass resolution
+                # Only trigger if: (1) multiple high-score candidates AND (2) scores are close
+                if len(high_score_candidates) > 1:
+                    # Sort by score descending to check gap
+                    sorted_candidates = sorted(high_score_candidates, key=lambda x: x.score, reverse=True)
+                    top1_score = sorted_candidates[0].score
+                    top2_score = sorted_candidates[1].score
+                    score_gap = top1_score - top2_score
+
+                    if score_gap < AMBIGUOUS_SCORE_GAP_THRESHOLD:
+                        # Scores are close - needs second-pass resolution
+                        ambiguous_entities.append((idx, extracted_entity, high_score_candidates))
+                        logger.debug(
+                            f'Entity "{extracted_entity.name}" has {len(high_score_candidates)} high-score candidates '
+                            f'with close scores (gap={score_gap:.2f} < {AMBIGUOUS_SCORE_GAP_THRESHOLD}), '
+                            f'marking for second-pass resolution'
+                        )
+                    else:
+                        # Clear winner - skip second-pass
+                        logger.debug(
+                            f'Entity "{extracted_entity.name}" has clear winner (gap={score_gap:.2f} >= {AMBIGUOUS_SCORE_GAP_THRESHOLD}), '
+                            f'skipping second-pass'
+                        )
+
+                # Get reasoning from the top candidate
+                if extracted_entity.top_candidates:
+                    top_candidate = extracted_entity.top_candidates[0]
+                    reasoning = top_candidate.reasoning
+                else:
+                    reasoning = None
         else:
-            entity_type_name = 'Entity'
+            # Handle non-scored entities (JSON extraction)
+            type_id = extracted_entity.entity_type_id
+            if 0 <= type_id < len(entity_types_context):
+                entity_type_name = entity_types_context[type_id].get('entity_type_name', 'Entity')
+            else:
+                entity_type_name = 'Entity'
+
+            reasoning = getattr(extracted_entity, 'reasoning', None)
+            type_scores_dict = None
+            type_confidence = None
 
         # Check if this entity type should be excluded
         if excluded_entity_types and entity_type_name in excluded_entity_types:
@@ -269,11 +541,6 @@ async def extract_nodes(
 
         labels: list[str] = list({'Entity', str(entity_type_name)})
 
-        # Get reasoning for debugging/analysis
-        reasoning = None
-        if hasattr(extracted_entity, 'reasoning') and extracted_entity.reasoning:
-            reasoning = extracted_entity.reasoning
-
         new_node = EntityNode(
             name=extracted_entity.name,
             group_id=episode.group_id,
@@ -281,9 +548,113 @@ async def extract_nodes(
             summary='',
             created_at=utc_now(),
             reasoning=reasoning,
+            type_scores=type_scores_dict,
+            type_confidence=type_confidence,
         )
         extracted_nodes.append(new_node)
-        logger.debug(f'Created new node: {new_node.name} (UUID: {new_node.uuid})')
+        logger.debug(f'Created new node: {new_node.name} (UUID: {new_node.uuid}, confidence: {type_confidence})')
+
+    # Second pass: Resolve ambiguous entities with multiple high-confidence candidates
+    if ambiguous_entities:
+        llm_start = time()
+        logger.info(f'Starting second-pass resolution for {len(ambiguous_entities)} ambiguous entities')
+
+        # Build context for batch resolution
+        ambiguous_entities_context = []
+        for idx, extracted_entity, high_candidates in ambiguous_entities:
+            candidate_type_ids = [tc.type_id for tc in high_candidates]
+            ambiguous_entities_context.append({
+                'name': extracted_entity.name,
+                'candidate_type_ids': candidate_type_ids,
+            })
+
+        # Build candidate types context (only include types that are candidates)
+        all_candidate_type_ids = set()
+        for _, _, high_candidates in ambiguous_entities:
+            for tc in high_candidates:
+                all_candidate_type_ids.add(tc.type_id)
+
+        candidate_types_context = [
+            entity_types_context[type_id]
+            for type_id in sorted(all_candidate_type_ids)
+            if 0 <= type_id < len(entity_types_context)
+        ]
+
+        resolution_context = {
+            'episode_content': episode.content,
+            'ambiguous_entities': ambiguous_entities_context,
+            'candidate_types': candidate_types_context,
+        }
+
+        try:
+            resolution_response = await llm_client.generate_response(
+                prompt_library.extract_nodes.resolve_ambiguous_types(resolution_context),
+                response_model=ResolvedEntityTypes,
+                group_id=episode.group_id,
+                prompt_name='extract_nodes.resolve_ambiguous_types',
+            )
+            llm_call_count += 1
+            perf_logger.info(f'[PERF]     └─ resolve_ambiguous_types: {(time() - llm_start)*1000:.0f}ms, entities={len(ambiguous_entities)}')
+
+            resolutions = ResolvedEntityTypes(**resolution_response)
+
+            # Build resolution map with candidate_scores
+            resolution_map: dict[str, tuple[int, str, list[CandidateTypeScore]]] = {}
+            for r in resolutions.resolutions:
+                resolution_map[r.name] = (r.chosen_type_id, r.reasoning, r.candidate_scores)
+
+            for idx, extracted_entity, high_candidates in ambiguous_entities:
+                if extracted_entity.name in resolution_map:
+                    chosen_type_id, resolution_reasoning, candidate_scores = resolution_map[extracted_entity.name]
+
+                    # Find the corresponding node and update it
+                    for node in extracted_nodes:
+                        if node.name == extracted_entity.name:
+                            if 0 <= chosen_type_id < len(entity_types_context):
+                                new_type_name = entity_types_context[chosen_type_id].get('entity_type_name', 'Entity')
+                                node.labels = list({'Entity', new_type_name})
+                                node.reasoning = f'[Second-pass resolution] {resolution_reasoning}'
+
+                                # Update type_scores: preserve pass1, add pass2 scores
+                                if node.type_scores is None:
+                                    node.type_scores = {}
+
+                                # Move current scores to pass1_* and update with pass2 scores
+                                for cs in candidate_scores:
+                                    if 0 <= cs.type_id < len(entity_types_context):
+                                        type_name = entity_types_context[cs.type_id].get('entity_type_name', 'Entity')
+                                        if type_name in node.type_scores:
+                                            # Preserve pass1 data
+                                            pass1_data = node.type_scores[type_name]
+                                            node.type_scores[type_name] = {
+                                                'score': cs.score,
+                                                'reasoning': cs.reasoning,
+                                                'pass1_score': pass1_data.get('score'),
+                                                'pass1_reasoning': pass1_data.get('reasoning'),
+                                            }
+                                        else:
+                                            # No pass1 data for this type
+                                            node.type_scores[type_name] = {
+                                                'score': cs.score,
+                                                'reasoning': cs.reasoning,
+                                            }
+
+                                # Update type_confidence with pass2 chosen type's score
+                                chosen_score = None
+                                for cs in candidate_scores:
+                                    if cs.type_id == chosen_type_id:
+                                        chosen_score = cs.score
+                                        break
+                                if chosen_score is not None:
+                                    node.type_confidence = chosen_score
+
+                                logger.info(
+                                    f'Resolved ambiguous entity "{node.name}" to type "{new_type_name}" '
+                                    f'(pass2 confidence: {chosen_score}) via second-pass with scoring'
+                                )
+                            break
+        except Exception as e:
+            logger.warning(f'Second-pass resolution failed: {e}, using first-pass results')
 
     logger.debug(f'Extracted nodes: {[(n.name, n.uuid) for n in extracted_nodes]}')
 
@@ -356,6 +727,11 @@ async def _collect_candidate_nodes(
     return ordered_candidates
 
 
+# Configuration for batched LLM deduplication
+DEDUP_BATCH_SIZE = 5  # Number of entities per LLM request
+DEDUP_PARALLELISM = 10  # Maximum concurrent LLM requests
+
+
 async def _resolve_with_llm(
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
@@ -366,6 +742,12 @@ async def _resolve_with_llm(
     entity_types: dict[str, type[BaseModel]] | None,
 ) -> None:
     """Escalate unresolved nodes to the dedupe prompt so the LLM can select or reject duplicates.
+
+    Uses scoring-based deduplication that requires LLM to score each candidate match.
+    Only merges entities when similarity_score >= DEDUP_SIMILARITY_THRESHOLD (0.7).
+
+    EasyOps customization: Process entities in batches to avoid LLM output truncation.
+    Each batch contains up to DEDUP_BATCH_SIZE entities, processed with DEDUP_PARALLELISM concurrency.
 
     The guardrails below defensively ignore malformed or duplicate LLM responses so the
     ingestion workflow remains deterministic even when the model misbehaves.
@@ -386,36 +768,7 @@ async def _resolve_with_llm(
                 if type_model and type_model.__doc__:
                     entity_type_definitions[label] = type_model.__doc__
 
-    extracted_nodes_context = [
-        {
-            'id': i,
-            'name': node.name,
-            'entity_type': node.labels,
-        }
-        for i, node in enumerate(llm_extracted_nodes)
-    ]
-
-    sent_ids = [ctx['id'] for ctx in extracted_nodes_context]
-    logger.debug(
-        'Sending %d entities to LLM for deduplication with IDs 0-%d (actual IDs sent: %s)',
-        len(llm_extracted_nodes),
-        len(llm_extracted_nodes) - 1,
-        sent_ids if len(sent_ids) < 20 else f'{sent_ids[:10]}...{sent_ids[-10:]}',
-    )
-    if llm_extracted_nodes:
-        sample_size = min(3, len(extracted_nodes_context))
-        logger.debug(
-            'First %d entities: %s',
-            sample_size,
-            [(ctx['id'], ctx['name']) for ctx in extracted_nodes_context[:sample_size]],
-        )
-        if len(extracted_nodes_context) > 3:
-            logger.debug(
-                'Last %d entities: %s',
-                sample_size,
-                [(ctx['id'], ctx['name']) for ctx in extracted_nodes_context[-sample_size:]],
-            )
-
+    # Build existing nodes context (shared across all batches)
     existing_nodes_context = [
         {
             **{
@@ -428,35 +781,98 @@ async def _resolve_with_llm(
         for i, candidate in enumerate(indexes.existing_nodes)
     ]
 
-    context = {
-        'extracted_nodes': extracted_nodes_context,
-        'existing_nodes': existing_nodes_context,
-        'entity_type_definitions': entity_type_definitions,
-        'episode_content': episode.content if episode is not None else '',
-        'previous_episodes': (
-            [ep.content for ep in previous_episodes] if previous_episodes is not None else []
-        ),
-    }
+    # Split entities into batches
+    batches: list[list[tuple[int, EntityNode]]] = []
+    current_batch: list[tuple[int, EntityNode]] = []
+    for global_idx, node in enumerate(llm_extracted_nodes):
+        current_batch.append((global_idx, node))
+        if len(current_batch) >= DEDUP_BATCH_SIZE:
+            batches.append(current_batch)
+            current_batch = []
+    if current_batch:
+        batches.append(current_batch)
 
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_nodes.nodes(context),
-        response_model=NodeResolutions,
-        prompt_name='dedupe_nodes.nodes',
+    logger.info(
+        'Deduplicating %d entities in %d batches (batch_size=%d, parallelism=%d)',
+        len(llm_extracted_nodes),
+        len(batches),
+        DEDUP_BATCH_SIZE,
+        DEDUP_PARALLELISM,
     )
 
-    node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
+    async def process_batch(
+        batch: list[tuple[int, EntityNode]],
+        batch_idx: int,
+    ) -> list[tuple[int, NodeDuplicateWithScores]]:
+        """Process a single batch and return results with global indices."""
+        # Build batch-specific extracted nodes context with local IDs (0 to batch_size-1)
+        batch_extracted_context = [
+            {
+                'id': local_idx,
+                'name': node.name,
+                'entity_type': node.labels,
+            }
+            for local_idx, (_, node) in enumerate(batch)
+        ]
 
+        context = {
+            'extracted_nodes': batch_extracted_context,
+            'existing_nodes': existing_nodes_context,
+            'entity_type_definitions': entity_type_definitions,
+            'episode_content': episode.content if episode is not None else '',
+            'previous_episodes': (
+                [ep.content for ep in previous_episodes] if previous_episodes is not None else []
+            ),
+        }
+
+        try:
+            llm_response = await llm_client.generate_response(
+                prompt_library.dedupe_nodes.nodes_with_scores(context),
+                response_model=NodeResolutionsWithScores,
+                prompt_name='dedupe_nodes.nodes_with_scores',
+            )
+            batch_resolutions = NodeResolutionsWithScores(**llm_response).entity_resolutions
+
+            # Map local IDs back to global indices
+            results: list[tuple[int, NodeDuplicateWithScores]] = []
+            for resolution in batch_resolutions:
+                local_id = resolution.id
+                if 0 <= local_id < len(batch):
+                    global_idx = batch[local_id][0]
+                    results.append((global_idx, resolution))
+                else:
+                    logger.warning(
+                        'Batch %d: invalid local ID %d (batch size: %d)',
+                        batch_idx,
+                        local_id,
+                        len(batch),
+                    )
+            return results
+        except Exception as e:
+            logger.error('Batch %d failed: %s', batch_idx, e)
+            return []
+
+    # Process batches in parallel with semaphore
+    all_results: list[tuple[int, NodeDuplicateWithScores]] = []
+    batch_results = await semaphore_gather(
+        *[process_batch(batch, idx) for idx, batch in enumerate(batches)],
+        max_coroutines=DEDUP_PARALLELISM,
+    )
+    for batch_result in batch_results:
+        all_results.extend(batch_result)
+
+    # Process all resolutions
     valid_relative_range = range(len(state.unresolved_indices))
     processed_relative_ids: set[int] = set()
 
-    received_ids = {r.id for r in node_resolutions}
+    received_ids = {global_idx for global_idx, _ in all_results}
     expected_ids = set(valid_relative_range)
     missing_ids = expected_ids - received_ids
     extra_ids = received_ids - expected_ids
 
     logger.debug(
         'Received %d resolutions for %d entities',
-        len(node_resolutions),
+        len(all_results),
         len(state.unresolved_indices),
     )
 
@@ -471,16 +887,16 @@ async def _resolve_with_llm(
             sorted(received_ids),
         )
 
-    for resolution in node_resolutions:
-        relative_id: int = resolution.id
-        duplicate_idx: int = resolution.duplicate_idx
+    for relative_id, resolution in all_results:
+        best_match_idx: int = resolution.best_match_idx
+        confidence: float = resolution.confidence
 
         if relative_id not in valid_relative_range:
             logger.warning(
                 'Skipping invalid LLM dedupe id %d (valid range: 0-%d, received %d resolutions)',
                 relative_id,
                 len(state.unresolved_indices) - 1,
-                len(node_resolutions),
+                len(all_results),
             )
             continue
 
@@ -492,15 +908,34 @@ async def _resolve_with_llm(
         original_index = state.unresolved_indices[relative_id]
         extracted_node = extracted_nodes[original_index]
 
+        # Find the best match score from candidate_scores
+        best_score = 0.0
+        best_reasoning = ''
+        for candidate_score in resolution.candidate_scores:
+            if candidate_score.candidate_idx == best_match_idx and candidate_score.is_same_entity:
+                best_score = candidate_score.similarity_score
+                best_reasoning = candidate_score.reasoning
+                break
+
         resolved_node: EntityNode
-        if duplicate_idx == -1:
+        # Apply threshold: only merge if score >= DEDUP_SIMILARITY_THRESHOLD
+        if best_match_idx == -1 or best_score < DEDUP_SIMILARITY_THRESHOLD:
             resolved_node = extracted_node
-        elif 0 <= duplicate_idx < len(indexes.existing_nodes):
-            resolved_node = indexes.existing_nodes[duplicate_idx]
+            if best_match_idx != -1 and best_score < DEDUP_SIMILARITY_THRESHOLD:
+                logger.info(
+                    'Dedupe: "%s" NOT merged with "%s" - score %.2f < threshold %.2f (confidence: %.2f)',
+                    extracted_node.name,
+                    indexes.existing_nodes[best_match_idx].name if 0 <= best_match_idx < len(indexes.existing_nodes) else 'unknown',
+                    best_score,
+                    DEDUP_SIMILARITY_THRESHOLD,
+                    confidence,
+                )
+        elif 0 <= best_match_idx < len(indexes.existing_nodes):
+            resolved_node = indexes.existing_nodes[best_match_idx]
         else:
             logger.warning(
-                'Invalid duplicate_idx %s for extracted node %s; treating as no duplicate.',
-                duplicate_idx,
+                'Invalid best_match_idx %s for extracted node %s; treating as no duplicate.',
+                best_match_idx,
                 extracted_node.uuid,
             )
             resolved_node = extracted_node
@@ -509,12 +944,14 @@ async def _resolve_with_llm(
         state.uuid_map[extracted_node.uuid] = resolved_node.uuid
         if resolved_node.uuid != extracted_node.uuid:
             state.duplicate_pairs.append((extracted_node, resolved_node))
-            # Log deduplication decision with reasoning for debugging
+            # Log deduplication decision with score and reasoning for debugging
             logger.info(
-                'Dedupe: "%s" -> "%s" (reasoning: %s)',
+                'Dedupe: "%s" -> "%s" (score: %.2f, confidence: %.2f, reasoning: %s)',
                 extracted_node.name,
                 resolved_node.name,
-                resolution.reasoning or 'no reasoning provided',
+                best_score,
+                confidence,
+                best_reasoning or 'no reasoning provided',
             )
 
 
@@ -584,11 +1021,19 @@ async def extract_attributes_from_nodes(
     entity_types: dict[str, type[BaseModel]] | None = None,
     should_summarize_node: NodeSummaryFilter | None = None,
 ) -> list[EntityNode]:
+    """Extract attributes and summaries from nodes.
+
+    EasyOps optimization: Uses batch summary extraction to reduce LLM calls.
+    - Attributes: extracted in parallel (each node needs its own entity_type)
+    - Summaries: extracted in batches of SUMMARY_BATCH_SIZE
+    """
     llm_client = clients.llm_client
     embedder = clients.embedder
-    updated_nodes: list[EntityNode] = await semaphore_gather(
+
+    # Step 1: Extract attributes in parallel (each node needs different entity_type)
+    await semaphore_gather(
         *[
-            extract_attributes_from_node(
+            _extract_attributes_and_update(
                 llm_client,
                 node,
                 episode,
@@ -598,15 +1043,49 @@ async def extract_attributes_from_nodes(
                     if entity_types is not None
                     else None
                 ),
-                should_summarize_node,
             )
             for node in nodes
         ]
     )
 
-    await create_entity_node_embeddings(embedder, updated_nodes)
+    # Step 2: Extract summaries in batches
+    # Split nodes into batches
+    batches: list[list[EntityNode]] = []
+    for i in range(0, len(nodes), SUMMARY_BATCH_SIZE):
+        batches.append(nodes[i : i + SUMMARY_BATCH_SIZE])
 
-    return updated_nodes
+    logger.info(
+        f'[bulk_summary] Processing {len(nodes)} nodes in {len(batches)} batches '
+        f'(batch_size={SUMMARY_BATCH_SIZE})'
+    )
+
+    # Process batches in parallel
+    await semaphore_gather(
+        *[
+            _extract_entity_summaries_bulk(
+                llm_client, batch, episode, previous_episodes, should_summarize_node
+            )
+            for batch in batches
+        ]
+    )
+
+    await create_entity_node_embeddings(embedder, nodes)
+
+    return nodes
+
+
+async def _extract_attributes_and_update(
+    llm_client: LLMClient,
+    node: EntityNode,
+    episode: EpisodicNode | None,
+    previous_episodes: list[EpisodicNode] | None,
+    entity_type: type[BaseModel] | None,
+) -> None:
+    """Extract attributes and update node in place."""
+    result = await _extract_entity_attributes(
+        llm_client, node, episode, previous_episodes, entity_type
+    )
+    node.attributes.update(result)
 
 
 async def extract_attributes_from_node(
@@ -617,6 +1096,11 @@ async def extract_attributes_from_node(
     entity_type: type[BaseModel] | None = None,
     should_summarize_node: NodeSummaryFilter | None = None,
 ) -> EntityNode:
+    """Extract attributes and summary for a single node.
+
+    Note: This is kept for backwards compatibility. For bulk operations,
+    use extract_attributes_from_nodes which uses batch summary extraction.
+    """
     # Extract attributes if entity type is defined and has attributes
     llm_response = await _extract_entity_attributes(
         llm_client, node, episode, previous_episodes, entity_type
@@ -734,6 +1218,99 @@ async def _extract_entity_summary(
     )
 
     node.summary = truncate_at_sentence(summary_response.get('summary', ''), MAX_SUMMARY_CHARS)
+
+
+# EasyOps: Batch summary extraction - process multiple entities in one LLM call
+async def _extract_entity_summaries_bulk(
+    llm_client: LLMClient,
+    nodes: list[EntityNode],
+    episode: EpisodicNode | None,
+    previous_episodes: list[EpisodicNode] | None,
+    should_summarize_node: NodeSummaryFilter | None,
+) -> None:
+    """Extract summaries for multiple entities in a single LLM call.
+
+    This reduces LLM API calls from N to N/SUMMARY_BATCH_SIZE.
+    Each batch is processed in parallel with other batches.
+    """
+    if not nodes:
+        return
+
+    # Filter nodes that need summarization
+    nodes_to_process: list[EntityNode] = []
+    if should_summarize_node is not None:
+        for node in nodes:
+            if await should_summarize_node(node):
+                nodes_to_process.append(node)
+    else:
+        nodes_to_process = list(nodes)
+
+    if not nodes_to_process:
+        return
+
+    # Build entities list for the prompt
+    entities_data = []
+    for i, node in enumerate(nodes_to_process):
+        entities_data.append({
+            'id': i,
+            'name': node.name,
+            'summary': truncate_at_sentence(node.summary, MAX_SUMMARY_CHARS) if node.summary else '',
+            'entity_types': node.labels,
+            'attributes': node.attributes,
+        })
+
+    # Build context for bulk extraction
+    context = {
+        'entities': entities_data,
+        'episode_content': episode.content if episode is not None else '',
+        'previous_episodes': (
+            [ep.content for ep in previous_episodes] if previous_episodes is not None else []
+        ),
+    }
+
+    # Use the first node's group_id for logging
+    group_id = nodes_to_process[0].group_id if nodes_to_process else None
+
+    try:
+        response = await llm_client.generate_response(
+            prompt_library.extract_nodes.extract_summaries_bulk(context),
+            response_model=EntitySummaries,
+            model_size=ModelSize.small,
+            group_id=group_id,
+            prompt_name='extract_nodes.extract_summaries_bulk',
+        )
+
+        # Parse response and update node summaries
+        summaries_list = response.get('summaries', [])
+        summaries_by_id: dict[int, str] = {}
+        for item in summaries_list:
+            entity_id = item.get('entity_id')
+            summary = item.get('summary', '')
+            if entity_id is not None:
+                summaries_by_id[entity_id] = summary
+
+        # Update nodes with extracted summaries
+        for i, node in enumerate(nodes_to_process):
+            if i in summaries_by_id:
+                node.summary = truncate_at_sentence(summaries_by_id[i], MAX_SUMMARY_CHARS)
+            else:
+                logger.warning(f'No summary returned for entity {node.name} (id={i})')
+
+        logger.info(
+            f'[bulk_summary] Extracted summaries for {len(summaries_by_id)}/{len(nodes_to_process)} entities'
+        )
+
+    except Exception as e:
+        logger.error(f'[bulk_summary] Failed to extract summaries in batch: {e}')
+        # Fallback to individual extraction
+        logger.info(f'[bulk_summary] Falling back to individual extraction for {len(nodes_to_process)} entities')
+        for node in nodes_to_process:
+            try:
+                await _extract_entity_summary(
+                    llm_client, node, episode, previous_episodes, should_summarize_node
+                )
+            except Exception as fallback_error:
+                logger.error(f'[bulk_summary] Individual fallback failed for {node.name}: {fallback_error}')
 
 
 def _build_episode_context(

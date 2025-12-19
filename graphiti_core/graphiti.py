@@ -460,8 +460,14 @@ class Graphiti:
         dict[str, list[EntityNode]],
         dict[str, str],
         list[list[EntityEdge]],
+        dict[str, list[EntityNode]],  # db_candidates_by_type
     ]:
-        """Extract nodes and edges from all episodes and deduplicate."""
+        """Extract nodes and edges from all episodes and deduplicate.
+
+        EasyOps optimization: dedupe_nodes_bulk now only does deterministic matching
+        (exact string + MinHash). LLM deduplication is deferred to semantic_dedupe_nodes_bulk
+        which runs after attributes extraction.
+        """
         # Extract all nodes and edges for each episode
         extracted_nodes_bulk, extracted_edges_bulk = await extract_nodes_and_edges_bulk(
             self.clients,
@@ -472,12 +478,12 @@ class Graphiti:
             excluded_entity_types=excluded_entity_types,
         )
 
-        # Dedupe extracted nodes in memory
-        nodes_by_episode, uuid_map = await dedupe_nodes_bulk(
+        # Dedupe extracted nodes in memory (deterministic only, collects DB candidates)
+        nodes_by_episode, uuid_map, db_candidates_by_type = await dedupe_nodes_bulk(
             self.clients, extracted_nodes_bulk, episode_context, entity_types
         )
 
-        return nodes_by_episode, uuid_map, extracted_edges_bulk
+        return nodes_by_episode, uuid_map, extracted_edges_bulk, db_candidates_by_type
 
     async def _resolve_nodes_and_edges_bulk(
         self,
@@ -489,56 +495,48 @@ class Graphiti:
         edge_type_map: dict[tuple[str, str], list[str]],
         episodes: list[EpisodicNode],
     ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
-        """Resolve nodes and edges against the existing graph."""
+        """Extract attributes and resolve edges.
+
+        EasyOps: Restored resolve_extracted_nodes call for LLM-based deduplication.
+        This enables delayed dedup strategy where we can later implement background
+        batch merging for duplicates that slip through.
+        """
         nodes_by_uuid: dict[str, EntityNode] = {
             node.uuid: node for nodes in nodes_by_episode.values() for node in nodes
         }
 
-        # Get unique nodes per episode
+        # Resolve nodes against existing graph using LLM deduplication
+        uuid_map: dict[str, str] = {}
+        nodes_by_episode_resolved: dict[str, list[EntityNode]] = {}
+
+        for episode, previous_episodes in episode_context:
+            nodes = nodes_by_episode.get(episode.uuid, [])
+            if not nodes:
+                nodes_by_episode_resolved[episode.uuid] = []
+                continue
+
+            resolved_nodes, episode_uuid_map, _ = await resolve_extracted_nodes(
+                self.clients,
+                nodes,
+                episode,
+                previous_episodes,
+                entity_types,
+            )
+            nodes_by_episode_resolved[episode.uuid] = resolved_nodes
+            uuid_map.update(episode_uuid_map)
+
+        # Get unique nodes per episode (after LLM dedup)
         nodes_by_episode_unique: dict[str, list[EntityNode]] = {}
         nodes_uuid_set: set[str] = set()
         for episode, _ in episode_context:
             nodes_by_episode_unique[episode.uuid] = []
-            nodes = [nodes_by_uuid[node.uuid] for node in nodes_by_episode[episode.uuid]]
+            nodes = nodes_by_episode_resolved.get(episode.uuid, [])
             for node in nodes:
                 if node.uuid not in nodes_uuid_set:
                     nodes_by_episode_unique[episode.uuid].append(node)
                     nodes_uuid_set.add(node.uuid)
 
-        # Resolve nodes
-        node_results = await semaphore_gather(
-            *[
-                resolve_extracted_nodes(
-                    self.clients,
-                    nodes_by_episode_unique[episode.uuid],
-                    episode,
-                    previous_episodes,
-                    entity_types,
-                )
-                for episode, previous_episodes in episode_context
-            ]
-        )
-
-        resolved_nodes: list[EntityNode] = []
-        uuid_map: dict[str, str] = {}
-        for result in node_results:
-            resolved_nodes.extend(result[0])
-            uuid_map.update(result[1])
-
-        # Update nodes_by_uuid with resolved nodes
-        for resolved_node in resolved_nodes:
-            nodes_by_uuid[resolved_node.uuid] = resolved_node
-
-        # Update nodes_by_episode_unique with resolved pointers
-        for episode_uuid, nodes in nodes_by_episode_unique.items():
-            updated_nodes: list[EntityNode] = []
-            for node in nodes:
-                updated_node_uuid = uuid_map.get(node.uuid, node.uuid)
-                updated_node = nodes_by_uuid[updated_node_uuid]
-                updated_nodes.append(updated_node)
-            nodes_by_episode_unique[episode_uuid] = updated_nodes
-
-        # Extract attributes for resolved nodes
+        # Extract attributes for nodes
         hydrated_nodes_results: list[list[EntityNode]] = await semaphore_gather(
             *[
                 extract_attributes_from_nodes(
@@ -552,51 +550,91 @@ class Graphiti:
             ]
         )
 
-        # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
-        entity_types_context = [
-            {
-                'entity_type_id': 0,
-                'entity_type_name': 'Entity',
-                'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
-            }
-        ]
-        if entity_types:
-            entity_types_context += [
-                {
-                    'entity_type_id': i + 1,
-                    'entity_type_name': type_name,
-                    'entity_type_description': type_model.__doc__,
-                }
-                for i, (type_name, type_model) in enumerate(entity_types.items())
-            ]
+        # EasyOps: Disabled filter_extracted_nodes - now using Top 3 scoring + second-pass resolution
+        # The two-step validation (validate_entity_types + reclassify) is redundant with new approach
+        # ========== BEGIN COMMENTED OUT ==========
+        # # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+        # entity_types_context = [
+        #     {
+        #         'entity_type_id': 0,
+        #         'entity_type_name': 'Entity',
+        #         'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+        #     }
+        # ]
+        # if entity_types:
+        #     entity_types_context += [
+        #         {
+        #             'entity_type_id': i + 1,
+        #             'entity_type_name': type_name,
+        #             'entity_type_description': type_model.__doc__,
+        #         }
+        #         for i, (type_name, type_model) in enumerate(entity_types.items())
+        #     ]
+        #
+        # # Filter each episode's nodes in parallel
+        # filter_results: list[tuple[list[str], list]] = await semaphore_gather(
+        #     *[
+        #         filter_extracted_nodes(
+        #             self.llm_client,
+        #             episode,
+        #             hydrated_nodes_results[i],
+        #             episode.group_id,
+        #             entity_types_context,
+        #         )
+        #         for i, (episode, _) in enumerate(episode_context)
+        #     ]
+        # )
+        #
+        # # Collect all entities to remove and reclassify
+        # all_entities_to_remove: set[str] = set()
+        # all_reclassifications: dict[str, tuple[str, str]] = {}  # name -> (new_type, reason)
+        # for entities_to_remove, entities_to_reclassify in filter_results:
+        #     all_entities_to_remove.update(entities_to_remove)
+        #     for reclass in entities_to_reclassify:
+        #         all_reclassifications[reclass.name] = (reclass.new_type, reclass.reason)
+        #
+        # # Apply reclassifications to nodes
+        # if all_reclassifications:
+        #     for nodes in hydrated_nodes_results:
+        #         for node in nodes:
+        #             if node.name in all_reclassifications:
+        #                 new_type, reason = all_reclassifications[node.name]
+        #                 old_labels = node.labels.copy()
+        #                 # Update labels: keep 'Entity', replace specific type
+        #                 node.labels = ['Entity', new_type] if new_type != 'Entity' else ['Entity']
+        #
+        #                 # Clear attributes not belonging to new type schema
+        #                 # This prevents attribute pollution when reclassifying from one type to another
+        #                 if entity_types and new_type in entity_types:
+        #                     new_type_model = entity_types[new_type]
+        #                     valid_fields = set(new_type_model.model_fields.keys())
+        #                     old_attrs = node.attributes.copy()
+        #                     node.attributes = {k: v for k, v in node.attributes.items() if k in valid_fields}
+        #                     if old_attrs != node.attributes:
+        #                         removed_attrs = set(old_attrs.keys()) - set(node.attributes.keys())
+        #                         logger.info(f'[bulk_reclassify] Cleared invalid attributes from "{node.name}": {removed_attrs}')
+        #                 elif new_type == 'Entity':
+        #                     # Reclassified to generic Entity, clear all custom attributes
+        #                     if node.attributes:
+        #                         logger.info(f'[bulk_reclassify] Cleared all attributes from "{node.name}" (reclassified to Entity)')
+        #                         node.attributes = {}
+        #
+        #                 # Update reasoning with reclassification reason
+        #                 node.reasoning = f'[Reclassified from {old_labels} to {node.labels}] {reason}'
+        #                 logger.info(f'[bulk_reclassify] Reclassified "{node.name}": {old_labels} -> {node.labels}, reason: {reason}')
+        #
+        # if all_entities_to_remove:
+        #     # Filter nodes in each episode's results
+        #     filtered_hydrated_nodes_results: list[list[EntityNode]] = []
+        #     for nodes in hydrated_nodes_results:
+        #         filtered_nodes = [n for n in nodes if n.name not in all_entities_to_remove]
+        #         filtered_hydrated_nodes_results.append(filtered_nodes)
+        #     hydrated_nodes_results = filtered_hydrated_nodes_results
+        #     logger.info(f'[bulk_filter] Filtered {len(all_entities_to_remove)} entities: {list(all_entities_to_remove)}')
+        # ========== END COMMENTED OUT ==========
 
-        # Filter each episode's nodes in parallel
-        filter_results: list[list[str]] = await semaphore_gather(
-            *[
-                filter_extracted_nodes(
-                    self.llm_client,
-                    episode,
-                    hydrated_nodes_results[i],
-                    episode.group_id,
-                    entity_types_context,
-                )
-                for i, (episode, _) in enumerate(episode_context)
-            ]
-        )
-
-        # Collect all entities to remove and filter hydrated_nodes_results
+        # Since filter step is disabled, no entities are removed
         all_entities_to_remove: set[str] = set()
-        for entities_to_remove in filter_results:
-            all_entities_to_remove.update(entities_to_remove)
-
-        if all_entities_to_remove:
-            # Filter nodes in each episode's results
-            filtered_hydrated_nodes_results: list[list[EntityNode]] = []
-            for nodes in hydrated_nodes_results:
-                filtered_nodes = [n for n in nodes if n.name not in all_entities_to_remove]
-                filtered_hydrated_nodes_results.append(filtered_nodes)
-            hydrated_nodes_results = filtered_hydrated_nodes_results
-            logger.info(f'[bulk_filter] Filtered {len(all_entities_to_remove)} entities: {list(all_entities_to_remove)}')
 
         final_hydrated_nodes = [node for nodes in hydrated_nodes_results for node in nodes]
 
@@ -871,47 +909,82 @@ class Graphiti:
                 )
                 perf_logger.info(f'[PERF] resolve_edges + extract_attrs (parallel): {(time() - step_start)*1000:.0f}ms, resolved={len(resolved_edges)}, invalidated={len(invalidated_edges)}')
 
-                # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
-                step_start = time()
-                entity_types_context = [
-                    {
-                        'entity_type_id': 0,
-                        'entity_type_name': 'Entity',
-                        'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
-                    }
-                ]
-                if entity_types:
-                    entity_types_context += [
-                        {
-                            'entity_type_id': i + 1,
-                            'entity_type_name': type_name,
-                            'entity_type_description': type_model.__doc__,
-                        }
-                        for i, (type_name, type_model) in enumerate(entity_types.items())
-                    ]
-                entities_to_remove = await filter_extracted_nodes(
-                    self.llm_client,
-                    episode,
-                    hydrated_nodes,
-                    group_id,
-                    entity_types_context,
-                )
-                if entities_to_remove:
-                    entities_to_remove_set = set(entities_to_remove)
-                    original_count = len(hydrated_nodes)
-                    hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
-                    # Also filter edges that reference removed nodes
-                    removed_uuids = {n.uuid for n in nodes if n.name in entities_to_remove_set}
-                    resolved_edges = [
-                        e for e in resolved_edges
-                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
-                    ]
-                    invalidated_edges = [
-                        e for e in invalidated_edges
-                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
-                    ]
-                    logger.info(f'Filtered {original_count - len(hydrated_nodes)} entities: {entities_to_remove}')
-                perf_logger.info(f'[PERF] filter_entities: {(time() - step_start)*1000:.0f}ms, removed={len(entities_to_remove)}')
+                # EasyOps: Disabled filter_extracted_nodes - now using Top 3 scoring + second-pass resolution
+                # The two-step validation (validate_entity_types + reclassify) is redundant with new approach
+                # ========== BEGIN COMMENTED OUT ==========
+                # # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+                # step_start = time()
+                # entity_types_context = [
+                #     {
+                #         'entity_type_id': 0,
+                #         'entity_type_name': 'Entity',
+                #         'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+                #     }
+                # ]
+                # if entity_types:
+                #     entity_types_context += [
+                #         {
+                #             'entity_type_id': i + 1,
+                #             'entity_type_name': type_name,
+                #             'entity_type_description': type_model.__doc__,
+                #         }
+                #         for i, (type_name, type_model) in enumerate(entity_types.items())
+                #     ]
+                # entities_to_remove, entities_to_reclassify = await filter_extracted_nodes(
+                #     self.llm_client,
+                #     episode,
+                #     hydrated_nodes,
+                #     group_id,
+                #     entity_types_context,
+                # )
+                #
+                # # Apply reclassifications to nodes
+                # if entities_to_reclassify:
+                #     # Store both new_type and reason for updating node.reasoning
+                #     reclassify_map = {r.name: (r.new_type, r.reason) for r in entities_to_reclassify}
+                #     for node in hydrated_nodes:
+                #         if node.name in reclassify_map:
+                #             new_type, reason = reclassify_map[node.name]
+                #             old_labels = node.labels.copy()
+                #             node.labels = ['Entity', new_type] if new_type != 'Entity' else ['Entity']
+                #
+                #             # Clear attributes not belonging to new type schema
+                #             # This prevents attribute pollution when reclassifying from one type to another
+                #             if entity_types and new_type in entity_types:
+                #                 new_type_model = entity_types[new_type]
+                #                 valid_fields = set(new_type_model.model_fields.keys())
+                #                 old_attrs = node.attributes.copy()
+                #                 node.attributes = {k: v for k, v in node.attributes.items() if k in valid_fields}
+                #                 if old_attrs != node.attributes:
+                #                     removed_attrs = set(old_attrs.keys()) - set(node.attributes.keys())
+                #                     logger.info(f'Cleared invalid attributes from "{node.name}": {removed_attrs}')
+                #             elif new_type == 'Entity':
+                #                 # Reclassified to generic Entity, clear all custom attributes
+                #                 if node.attributes:
+                #                     logger.info(f'Cleared all attributes from "{node.name}" (reclassified to Entity)')
+                #                     node.attributes = {}
+                #
+                #             # Update reasoning with reclassification reason
+                #             node.reasoning = f'[Reclassified from {old_labels} to {node.labels}] {reason}'
+                #             logger.info(f'Reclassified "{node.name}": {old_labels} -> {node.labels}, reason: {reason}')
+                #
+                # if entities_to_remove:
+                #     entities_to_remove_set = set(entities_to_remove)
+                #     original_count = len(hydrated_nodes)
+                #     hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
+                #     # Also filter edges that reference removed nodes
+                #     removed_uuids = {n.uuid for n in nodes if n.name in entities_to_remove_set}
+                #     resolved_edges = [
+                #         e for e in resolved_edges
+                #         if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                #     ]
+                #     invalidated_edges = [
+                #         e for e in invalidated_edges
+                #         if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                #     ]
+                #     logger.info(f'Filtered {original_count - len(hydrated_nodes)} entities: {entities_to_remove}')
+                # perf_logger.info(f'[PERF] filter_entities: {(time() - step_start)*1000:.0f}ms, removed={len(entities_to_remove)}, reclassified={len(entities_to_reclassify)}')
+                # ========== END COMMENTED OUT ==========
 
                 entity_edges = resolved_edges + invalidated_edges
 
@@ -1085,6 +1158,7 @@ class Graphiti:
                     nodes_by_episode,
                     uuid_map,
                     extracted_edges_bulk,
+                    db_candidates_by_type,
                 ) = await self._extract_and_dedupe_nodes_bulk(
                     episode_context,
                     edge_type_map or edge_type_map_default,
@@ -1128,14 +1202,25 @@ class Graphiti:
                     episodes,
                 )
 
-                # EasyOps: LLM semantic deduplication after attributes are extracted
-                final_hydrated_nodes = await semantic_dedupe_nodes_bulk(
-                    self.clients,
-                    final_hydrated_nodes,
-                    entity_types,
-                )
+                # EasyOps: Disabled semantic_dedupe_nodes_bulk - now using resolve_extracted_nodes
+                # in _resolve_nodes_and_edges_bulk for LLM deduplication.
+                # This enables delayed dedup strategy where background batch merging can handle
+                # duplicates that slip through deterministic matching.
+                # ========== BEGIN COMMENTED OUT ==========
+                # # EasyOps: LLM semantic deduplication after attributes are extracted
+                # # This now handles BOTH batch-internal dedup AND database dedup in one pass
+                # final_hydrated_nodes, semantic_uuid_map = await semantic_dedupe_nodes_bulk(
+                #     self.clients,
+                #     final_hydrated_nodes,
+                #     entity_types,
+                #     db_candidates_by_type,
+                # )
+                #
+                # # Merge uuid maps from deterministic dedup and semantic dedup
+                # final_uuid_map.update(semantic_uuid_map)
+                # ========== END COMMENTED OUT ==========
 
-                # Resolved pointers for episodic edges
+                # Resolved pointers for episodic edges (apply uuid map from LLM dedup)
                 resolved_episodic_edges = resolve_edge_pointers(episodic_edges, final_uuid_map)
 
                 # save data to KG
