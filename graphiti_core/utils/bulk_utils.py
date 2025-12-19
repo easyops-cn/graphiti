@@ -129,7 +129,7 @@ async def _search_db_candidates_by_type(
                 query=node.name,
                 group_ids=[group_id],
                 config=DEDUP_SEARCH_CONFIG,
-                search_filter=SearchFilters(node_labels=[entity_type, 'Entity']),
+                search_filter=SearchFilters(node_labels=[entity_type]),
             )
         )
 
