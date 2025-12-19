@@ -10,12 +10,14 @@
 | `graphiti_core/models/edges/edge_db_queries.py` | 逻辑修改 | MERGE 按节点对合并，避免重复边 |
 | `graphiti_core/utils/bulk_utils.py` | 逻辑修改 | 按边类型分组保存 |
 | `graphiti_core/utils/bulk_utils.py` | 新增函数 | 批量去重第三轮 LLM 语义去重 |
-| `graphiti_core/utils/bulk_utils.py` | **性能优化** | **去重流程优化：去掉第一轮 LLM，合并候选，并行处理** |
+| `graphiti_core/utils/bulk_utils.py` | **架构重构** | **聚类去重：避免自匹配问题 + 按类型分组 + Map-Reduce** |
+| `graphiti_core/prompts/dedupe_nodes.py` | **新增** | **EntityClustering 模型 + cluster_entities 提示词** |
+| `graphiti_core/graphiti.py` | **性能优化** | **移除 resolve_extracted_nodes 调用，改用 semantic_dedupe_nodes_bulk** |
+| `graphiti_core/graphiti.py` | **性能优化** | **移除全局 DB 候选收集，由 Map 阶段按批处理** |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
 | `graphiti_core/prompts/extract_nodes.py` | 新增 | Knowledge Graph Builder's Principles + filter_entities |
 | `graphiti_core/utils/maintenance/node_operations.py` | 新增 | filter_extracted_nodes 函数（接收 EntityNode 含 summary） |
 | `graphiti_core/graphiti.py` | 逻辑修改 | **Filter 步骤移到 extract_attributes 之后（获取 summary 后再过滤）** |
-| `graphiti_core/graphiti.py` | **性能优化** | **去掉 resolve_extracted_nodes 调用，优化去重流程** |
 | `graphiti_core/llm_client/openai_generic_client.py` | 新增 | small_model 支持 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | 候选搜索按同实体类型过滤 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 候选搜索按同边类型过滤 |
@@ -46,12 +48,15 @@
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | **两阶段类型分类：Top 3 打分 + 歧义消解** |
 | `graphiti_core/utils/maintenance/node_operations.py` | 性能优化 | **实体去重分批并行处理，避免 LLM 输出截断** |
 | `graphiti_core/helpers.py` | Bug修复 | **lucene_sanitize 添加反引号转义，修复 RediSearch 语法错误** |
+| `graphiti_core/utils/bulk_utils.py` | **Bug修复** | **批量去重传递 entity_type_definitions，启用别名匹配** |
+| `graphiti_core/prompts/dedupe_nodes.py` | **Prompt增强** | **nodes() 添加别名匹配指导，识别 "或" 分隔的别名** |
 | `graphiti_core/prompts/extract_nodes.py` | **功能增强** | **反思环节增加负向反思：识别不该抽取的实体、类型错误的实体** |
 | `graphiti_core/prompts/extract_edges.py` | **功能增强** | **反思环节增加负向反思：识别不正确的关系、类型错误的关系** |
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | **extract_nodes_reflexion 处理负向反思结果** |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | **extract_edges 反思处理负向反思结果** |
 | `graphiti_core/prompts/extract_nodes.py` | **性能优化** | **批量 Summary 提取：EntitySummaries 模型 + extract_summaries_bulk 提示词** |
 | `graphiti_core/utils/maintenance/node_operations.py` | **性能优化** | **_extract_entity_summaries_bulk 批量提取 + extract_attributes_from_nodes 改用批量** |
+| `scripts/cleanup_duplicate_nodes.py` | **新增脚本** | **离线清理重复节点：用 LLM 识别并合并数据库中的历史重复数据** |
 
 ---
 
@@ -2693,3 +2698,450 @@ except Exception as e:
 | `graphiti_core/utils/maintenance/node_operations.py` | 新增 `_extract_entity_summaries_bulk()` 函数 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 新增 `_extract_attributes_and_update()` 辅助函数 |
 | `graphiti_core/utils/maintenance/node_operations.py` | 重构 `extract_attributes_from_nodes()` 使用批量提取 |
+
+---
+
+## 两轮 Map-Reduce 语义去重（Semantic Dedup with Map-Reduce）
+
+### 问题背景
+
+之前的去重流程存在问题：
+
+1. `resolve_extracted_nodes` 在 `_resolve_nodes_and_edges_bulk` 中被调用
+2. 此时节点还没有 summary，LLM 只能看到 name，决策质量差
+3. 是串行执行的（一个 episode 一个 episode 处理）
+
+### 解决方案
+
+1. **移除** `_resolve_nodes_and_edges_bulk` 中的 `resolve_extracted_nodes` 调用
+2. **启用** `semantic_dedupe_nodes_bulk`，在 `extract_attributes_from_nodes` 之后执行
+3. **改为两轮 Map-Reduce**：分批并行 + 跨批去重
+
+### 修改后的流程
+
+```
+add_episode_bulk
+  ↓
+_extract_and_dedupe_nodes_bulk
+  └─ dedupe_nodes_bulk (确定性去重)
+  ↓
+_resolve_nodes_and_edges_bulk
+  ├─ 【已删除】resolve_extracted_nodes
+  └─ extract_attributes_from_nodes (提取 summary)
+  ↓
+semantic_dedupe_nodes_bulk (两轮 Map-Reduce，有 summary)
+  ↓
+add_nodes_and_edges_bulk (保存)
+```
+
+### Map-Reduce 设计
+
+#### 第一轮：Map（分批并行去重）
+
+```
+输入: 100 个节点（按类型分组）
+     ↓
+分批: [batch_1: 10个], [batch_2: 10个], ..., [batch_10: 10个]
+     ↓ 并行执行
+每批任务:
+  - 批内节点相互比较 → LLM 判断重复
+  - 批内节点 vs DB 候选 → LLM 判断重复
+     ↓
+输出: 每批的 (去重后节点, duplicate_pairs)
+```
+
+#### 第二轮：Reduce（跨批去重）
+
+```
+输入: 10 个批次的代表节点
+     ↓
+跨批去重: LLM 判断不同批次的节点是否重复
+     ↓
+输出: 最终的 uuid_map（使用并查集合并）
+```
+
+### 新增函数
+
+```python
+async def _map_batch_dedup(
+    llm_client: LLMClient,
+    batch_nodes: list[EntityNode],
+    db_candidates: list[EntityNode],
+    entity_types: dict[str, type[BaseModel]] | None,
+) -> tuple[list[EntityNode], list[tuple[str, str]]]:
+    """Map phase: 单批次去重（批内 + DB 候选）"""
+
+async def _reduce_cross_batch_dedup(
+    llm_client: LLMClient,
+    representative_nodes: list[EntityNode],
+    entity_types: dict[str, type[BaseModel]] | None,
+) -> tuple[list[EntityNode], list[tuple[str, str]]]:
+    """Reduce phase: 跨批次去重"""
+
+def _build_uuid_map_from_pairs(
+    duplicate_pairs: list[tuple[str, str]]
+) -> dict[str, str]:
+    """使用并查集处理链式映射和冲突"""
+```
+
+### 冲突处理
+
+使用并查集处理：
+- `A->B, B->C` 折叠为 `A->C, B->C`
+- `A->B, A->C` 保留第一个（先到先得）
+
+### 配置参数
+
+- `batch_size`: 每批节点数，默认 10
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/graphiti.py` | 删除 `resolve_extracted_nodes` 调用 |
+| `graphiti_core/graphiti.py` | 启用 `semantic_dedupe_nodes_bulk` 调用 |
+| `graphiti_core/utils/bulk_utils.py` | 重写 `semantic_dedupe_nodes_bulk` 为 Map-Reduce |
+| `graphiti_core/utils/bulk_utils.py` | 新增 `_map_batch_dedup()` 函数 |
+| `graphiti_core/utils/bulk_utils.py` | 新增 `_reduce_cross_batch_dedup()` 函数 |
+| `graphiti_core/utils/bulk_utils.py` | 新增 `_build_uuid_map_from_pairs()` 函数 |
+
+---
+
+## 实体去重 LLM 调用优化（Dedup LLM Call Optimization）
+
+### 问题背景
+
+原有的 Map-Reduce 去重存在严重的性能问题：
+
+1. **全局 DB 候选收集**：在去重前收集所有节点的 DB 候选（每节点搜 20 个），导致大量 DB 候选被收集但实际只用一部分
+2. **O(n²) 批内去重**：每个节点单独调用 LLM 对比后续节点，N 个节点需要 N 次 LLM 调用
+3. **批内去重 + DB 匹配分离**：分两步处理，增加了 LLM 调用次数
+
+**实际案例**：91 个 Feature 实体产生了 186 次 LLM 调用（理论上应该远少于此）。
+
+### 解决方案
+
+#### 1. 每批独立搜索 DB 候选
+
+**修改前**：
+```python
+# 全局收集所有节点的 DB 候选
+db_search_results = await semaphore_gather(
+    *[_collect_candidate_nodes(clients, nodes, None) for nodes in extracted_nodes]
+)
+# 传给每个 batch
+for batch in batches:
+    await _map_batch_dedup(llm_client, batch, filtered_db_candidates, ...)
+```
+
+**修改后**：
+```python
+async def _map_batch_dedup(clients, batch_nodes, entity_types):
+    # 每个 batch 独立搜索自己的 DB 候选
+    db_candidates = await _search_batch_db_candidates(clients, batch_nodes)
+    # 一次 LLM 调用
+    ...
+```
+
+**新增配置**：
+```python
+# 每节点搜索 10 个候选（原来是 20）
+DEDUP_SEARCH_LIMIT = 10
+DEDUP_SEARCH_CONFIG = SearchConfig(
+    limit=DEDUP_SEARCH_LIMIT,
+    node_config=NodeSearchConfig(
+        search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity],
+        reranker=NodeReranker.rrf,
+    )
+)
+```
+
+#### 2. 合并批内去重 + DB 匹配为单次 LLM 调用
+
+**修改前**：
+```python
+async def _map_batch_dedup(llm_client, batch_nodes, db_candidates, ...):
+    # 步骤1: 批内去重 - 每个节点单独调 LLM（O(n²)）
+    for i, node in enumerate(batch_nodes):
+        candidates = [n for n in batch_nodes[i + 1:] if ...]
+        if candidates:
+            llm_pairs = await _resolve_batch_with_llm(llm_client, [node], candidates, ...)
+
+    # 步骤2: DB 匹配 - 又一次 LLM 调用
+    if remaining_nodes and db_candidates:
+        llm_pairs = await _resolve_batch_with_llm(llm_client, remaining_nodes, db_candidates, ...)
+```
+
+**修改后**：
+```python
+async def _map_batch_dedup(clients, batch_nodes, entity_types):
+    db_candidates = await _search_batch_db_candidates(clients, batch_nodes)
+
+    # 所有候选 = DB 候选 + batch 其他节点（DB 放前面表示优先）
+    all_candidates = db_candidates + batch_nodes
+
+    # 一次 LLM 调用搞定
+    llm_pairs = await _resolve_batch_with_llm(
+        clients.llm_client, batch_nodes, all_candidates, entity_types
+    )
+```
+
+#### 3. Reduce 阶段简化
+
+**修改前**：
+```python
+async def _reduce_cross_batch_dedup(llm_client, representative_nodes, ...):
+    # 每个节点单独调 LLM（O(n²)）
+    for i, node in enumerate(representative_nodes):
+        candidates = [n for n in representative_nodes[i + 1:] if ...]
+        if candidates:
+            llm_pairs = await _resolve_batch_with_llm(llm_client, [node], candidates, ...)
+```
+
+**修改后**：
+```python
+async def _reduce_cross_batch_dedup(llm_client, representative_nodes, ...):
+    # 一次 LLM 调用
+    llm_pairs = await _resolve_batch_with_llm(
+        llm_client, representative_nodes, representative_nodes, entity_types
+    )
+```
+
+#### 4. 移除全局 DB 候选收集
+
+`dedupe_nodes_bulk` 不再返回 `db_candidates_by_type`，函数签名从：
+```python
+async def dedupe_nodes_bulk(...) -> tuple[dict, dict, dict]:
+```
+改为：
+```python
+async def dedupe_nodes_bulk(...) -> tuple[dict, dict]:
+```
+
+### 优化效果
+
+| 指标 | 修改前 | 修改后 |
+|-----|-------|-------|
+| Map 阶段 LLM 调用 | N × batch_count 次 | batch_count 次 |
+| Reduce 阶段 LLM 调用 | N × (N-1)/2 次 | 1 次 |
+| 每节点 DB 候选数 | 20 | 10 |
+| 候选收集时机 | 全局预收集 | 按批实时搜索 |
+
+**预期效果**：91 个 Feature 实体从 186 次 LLM 调用减少到约 10 次（10 个 batch × 1 次 + 1 次 Reduce）。
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/utils/bulk_utils.py` | 新增 `DEDUP_SEARCH_LIMIT`、`DEDUP_SEARCH_CONFIG` 常量 |
+| `graphiti_core/utils/bulk_utils.py` | 新增 `_search_batch_db_candidates()` 函数 |
+| `graphiti_core/utils/bulk_utils.py` | 重写 `_map_batch_dedup()` - 每批独立搜候选 + 单次 LLM |
+| `graphiti_core/utils/bulk_utils.py` | 重写 `_reduce_cross_batch_dedup()` - 单次 LLM |
+| `graphiti_core/utils/bulk_utils.py` | 重写 `semantic_dedupe_nodes_bulk()` - 移除 db_candidates_by_type 参数 |
+| `graphiti_core/utils/bulk_utils.py` | 重写 `dedupe_nodes_bulk()` - 移除 DB 候选收集和返回 |
+| `graphiti_core/graphiti.py` | 更新 `_extract_and_dedupe_nodes_bulk()` - 移除 db_candidates_by_type |
+| `graphiti_core/graphiti.py` | 更新 `add_episodes_bulk()` - 移除 db_candidates_by_type 传递 |
+
+---
+
+## 离线清理脚本（Offline Cleanup Script）
+
+### 问题背景
+
+两轮 Map-Reduce 语义去重只能处理：
+1. 新节点 vs 新节点
+2. 新节点 vs 数据库候选
+
+但无法处理：数据库中已存在的重复节点（历史数据）。
+
+如果数据库中已经存在多个重复的 ProductModule 节点（如 `EasyITSM`、`IT服务中心`、`ITSC服务中心`），这些节点不会被自动合并。
+
+### 解决方案
+
+提供离线清理脚本 `scripts/cleanup_duplicate_nodes.py`，使用 LLM 识别并合并数据库中的重复实体。
+
+### 使用方法
+
+```bash
+# 干运行（不做实际修改，只显示会做什么）
+python scripts/cleanup_duplicate_nodes.py --group-id easyops_support --dry-run
+
+# 清理特定实体类型
+python scripts/cleanup_duplicate_nodes.py --group-id easyops_support --entity-type ProductModule
+
+# 清理所有实体类型
+python scripts/cleanup_duplicate_nodes.py --group-id easyops_support
+
+# 指定数据库连接
+python scripts/cleanup_duplicate_nodes.py \
+    --group-id easyops_support \
+    --falkordb-host localhost \
+    --falkordb-port 6379 \
+    --falkordb-database elevo_memory
+```
+
+### 工作流程
+
+1. **查询节点**：从数据库查询指定 group_id 的所有实体节点，按类型分组
+2. **识别重复**：对每种类型的节点，使用 LLM 识别语义重复的节点对
+3. **合并节点**：
+   - 将源节点的所有边重定向到规范节点
+   - 合并源节点的 summary 和 attributes 到规范节点
+   - 删除源节点
+
+### 环境变量
+
+| 变量 | 说明 |
+|-----|------|
+| `OPENAI_API_KEY` | LLM API Key |
+| `OPENAI_MODEL` | LLM 模型名称 |
+| `OPENAI_BASE_URL` | LLM API 端点（可选） |
+| `FALKORDB_HOST` | FalkorDB 主机 |
+| `FALKORDB_PORT` | FalkorDB 端口 |
+| `FALKORDB_DATABASE` | 数据库名称 |
+
+### 注意事项
+
+1. **先干运行**：建议先用 `--dry-run` 查看会合并哪些节点
+2. **备份数据**：执行前建议备份数据库
+3. **LLM 成本**：每对节点比较都需要调用 LLM，大量节点会产生较高成本
+4. **执行时间**：O(n²) 复杂度，节点数多时耗时较长
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `scripts/cleanup_duplicate_nodes.py` | 新增离线清理脚本 |
+
+---
+
+## 27. 批量去重别名匹配修复（Alias-Based Deduplication）
+
+### 问题背景
+
+批量导入时，Schema 中定义的别名实体（如 `EasyITSM 或 IT服务中心`）未被正确去重，导致同一实体创建多个节点。
+
+**具体案例**：
+
+ProductModule 类型定义包含别名模式：
+```
+(5)EasyITSM 或 ITSM 或 IT服务中心
+```
+
+预期：`EasyITSM`、`ITSM`、`IT服务中心` 应被识别为同一实体的不同名称。
+
+实际：批量导入时这三个名称分别创建了独立节点。
+
+### 根因分析
+
+1. **`_resolve_batch_with_llm()` 未传递 `entity_type_definitions`**
+
+   每个节点的 `entity_type_description` 包含别名信息，但 context 构建时没有传递 `entity_type_definitions`：
+
+   ```python
+   # 修改前 (bulk_utils.py:145-150)
+   context = {
+       'extracted_nodes': extracted_nodes_context,
+       'existing_nodes': existing_nodes_context,
+       'episode_content': '',
+       'previous_episodes': [],
+       # 缺失: 'entity_type_definitions' 未传递！
+   }
+   ```
+
+2. **提示词未指导 LLM 使用别名信息**
+
+   `dedupe_nodes.py` 的 `nodes()` 函数：
+   - 期望 `entity_type_definitions` 但始终为空
+   - 没有说明如何使用 `entity_type_description` 中的别名模式
+   - 结果：LLM 只按字面名称匹配，不识别别名关系
+
+### 解决方案
+
+#### 27.1 传递 entity_type_definitions
+
+**文件**: `graphiti_core/utils/bulk_utils.py`
+
+在 `_resolve_batch_with_llm()` 中构建并传递 `entity_type_definitions`：
+
+```python
+entity_types_dict = entity_types or {}
+
+# Build entity_type_definitions for the prompt (EasyOps: enables alias-based deduplication)
+# This tells LLM about type definitions including alias patterns like "EasyITSM 或 IT服务中心"
+entity_type_definitions: dict[str, str] = {}
+for node in nodes:
+    for label in node.labels:
+        if label != 'Entity' and label not in entity_type_definitions:
+            type_model = entity_types_dict.get(label)
+            if type_model and type_model.__doc__:
+                entity_type_definitions[label] = type_model.__doc__
+
+# ... later in context ...
+context = {
+    'extracted_nodes': extracted_nodes_context,
+    'existing_nodes': existing_nodes_context,
+    'episode_content': '',
+    'previous_episodes': [],
+    'entity_type_definitions': entity_type_definitions,  # EasyOps: enables alias detection
+}
+```
+
+#### 27.2 添加别名匹配指导
+
+**文件**: `graphiti_core/prompts/dedupe_nodes.py`
+
+在 `nodes()` 函数中添加别名匹配的明确指导：
+
+```python
+def nodes(context: dict[str, Any]) -> list[Message]:
+    type_defs = context.get('entity_type_definitions', {})
+    type_defs_section = ''
+    alias_instruction = ''
+    if type_defs:
+        type_defs_section = f"""
+        <ENTITY TYPE DEFINITIONS>
+        {to_prompt_json(type_defs)}
+        </ENTITY TYPE DEFINITIONS>
+        """
+        # EasyOps: Add explicit alias matching instruction when type definitions are available
+        alias_instruction = """
+        **IMPORTANT - ALIAS MATCHING**:
+        The ENTITY TYPE DEFINITIONS above may contain alias patterns using "或" (Chinese "or").
+        For example: "(5)EasyITSM 或 ITSM 或 IT服务中心" means EasyITSM, ITSM, and IT服务中心 are ALL aliases for the SAME entity.
+        When you see entities with names matching these aliases, they MUST be marked as duplicates.
+        """
+```
+
+同时更新实体结构描述，包含 `summary` 和 `entity_type_description` 字段：
+
+```python
+Each entity in ENTITIES is represented as a JSON object with the following structure:
+{{
+    id: integer id of the entity,
+    name: "name of the entity",
+    summary: "brief description of the entity",
+    entity_type: ["Entity", "<optional additional label>", ...],
+    entity_type_description: "description of the entity type, may contain alias patterns"
+}}
+```
+
+### 效果
+
+| 实体名称 | 修复前 | 修复后 |
+|---------|-------|-------|
+| EasyITSM | 独立节点 | 去重为同一节点 |
+| IT服务中心 | 独立节点 | 去重为同一节点 |
+| ITSM | 独立节点 | 去重为同一节点 |
+
+LLM 现在能够：
+1. 看到 `<ENTITY TYPE DEFINITIONS>` 中的类型定义和别名模式
+2. 理解 "或" 表示的别名关系
+3. 正确将不同名称但属于同一别名组的实体标记为重复
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/utils/bulk_utils.py` | `_resolve_batch_with_llm()` 构建并传递 `entity_type_definitions` |
+| `graphiti_core/prompts/dedupe_nodes.py` | `nodes()` 添加 `alias_instruction` 和更完整的实体结构描述 |

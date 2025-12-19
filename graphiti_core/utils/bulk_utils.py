@@ -125,12 +125,11 @@ async def _search_db_candidates_by_type(
     for node in extracted_nodes:
         search_tasks.append(
             search(
-                clients.driver,
-                clients.embedder,
+                clients,
                 query=node.name,
-                config=DEDUP_SEARCH_CONFIG,
                 group_ids=[group_id],
-                search_filters=SearchFilters(node_labels=[entity_type, 'Entity']),
+                config=DEDUP_SEARCH_CONFIG,
+                search_filter=SearchFilters(node_labels=[entity_type, 'Entity']),
             )
         )
 

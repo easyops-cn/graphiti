@@ -460,13 +460,12 @@ class Graphiti:
         dict[str, list[EntityNode]],
         dict[str, str],
         list[list[EntityEdge]],
-        dict[str, list[EntityNode]],  # db_candidates_by_type
     ]:
         """Extract nodes and edges from all episodes and deduplicate.
 
-        EasyOps optimization: dedupe_nodes_bulk now only does deterministic matching
-        (exact string + MinHash). LLM deduplication is deferred to semantic_dedupe_nodes_bulk
-        which runs after attributes extraction.
+        EasyOps optimization: dedupe_nodes_bulk only does deterministic matching
+        (exact string + MinHash). LLM deduplication is handled by semantic_dedupe_nodes_bulk
+        which searches DB candidates per batch for better efficiency.
         """
         # Extract all nodes and edges for each episode
         extracted_nodes_bulk, extracted_edges_bulk = await extract_nodes_and_edges_bulk(
@@ -478,12 +477,12 @@ class Graphiti:
             excluded_entity_types=excluded_entity_types,
         )
 
-        # Dedupe extracted nodes in memory (deterministic only, collects DB candidates)
-        nodes_by_episode, uuid_map, db_candidates_by_type = await dedupe_nodes_bulk(
+        # Dedupe extracted nodes in memory (deterministic only)
+        nodes_by_episode, uuid_map = await dedupe_nodes_bulk(
             self.clients, extracted_nodes_bulk, episode_context, entity_types
         )
 
-        return nodes_by_episode, uuid_map, extracted_edges_bulk, db_candidates_by_type
+        return nodes_by_episode, uuid_map, extracted_edges_bulk
 
     async def _resolve_nodes_and_edges_bulk(
         self,
@@ -497,40 +496,23 @@ class Graphiti:
     ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
         """Extract attributes and resolve edges.
 
-        EasyOps: Restored resolve_extracted_nodes call for LLM-based deduplication.
-        This enables delayed dedup strategy where we can later implement background
-        batch merging for duplicates that slip through.
+        EasyOps: Removed resolve_extracted_nodes call (LLM dedup without summary).
+        LLM deduplication is now handled by semantic_dedupe_nodes_bulk after
+        extract_attributes_from_nodes, when summary is available for better decisions.
         """
         nodes_by_uuid: dict[str, EntityNode] = {
             node.uuid: node for nodes in nodes_by_episode.values() for node in nodes
         }
 
-        # Resolve nodes against existing graph using LLM deduplication
+        # uuid_map will be populated by semantic_dedupe_nodes_bulk later
         uuid_map: dict[str, str] = {}
-        nodes_by_episode_resolved: dict[str, list[EntityNode]] = {}
 
-        for episode, previous_episodes in episode_context:
-            nodes = nodes_by_episode.get(episode.uuid, [])
-            if not nodes:
-                nodes_by_episode_resolved[episode.uuid] = []
-                continue
-
-            resolved_nodes, episode_uuid_map, _ = await resolve_extracted_nodes(
-                self.clients,
-                nodes,
-                episode,
-                previous_episodes,
-                entity_types,
-            )
-            nodes_by_episode_resolved[episode.uuid] = resolved_nodes
-            uuid_map.update(episode_uuid_map)
-
-        # Get unique nodes per episode (after LLM dedup)
+        # Get unique nodes per episode (dedup by uuid within batch)
         nodes_by_episode_unique: dict[str, list[EntityNode]] = {}
         nodes_uuid_set: set[str] = set()
         for episode, _ in episode_context:
             nodes_by_episode_unique[episode.uuid] = []
-            nodes = nodes_by_episode_resolved.get(episode.uuid, [])
+            nodes = nodes_by_episode.get(episode.uuid, [])
             for node in nodes:
                 if node.uuid not in nodes_uuid_set:
                     nodes_by_episode_unique[episode.uuid].append(node)
@@ -1158,7 +1140,6 @@ class Graphiti:
                     nodes_by_episode,
                     uuid_map,
                     extracted_edges_bulk,
-                    db_candidates_by_type,
                 ) = await self._extract_and_dedupe_nodes_bulk(
                     episode_context,
                     edge_type_map or edge_type_map_default,
@@ -1202,23 +1183,16 @@ class Graphiti:
                     episodes,
                 )
 
-                # EasyOps: Disabled semantic_dedupe_nodes_bulk - now using resolve_extracted_nodes
-                # in _resolve_nodes_and_edges_bulk for LLM deduplication.
-                # This enables delayed dedup strategy where background batch merging can handle
-                # duplicates that slip through deterministic matching.
-                # ========== BEGIN COMMENTED OUT ==========
-                # # EasyOps: LLM semantic deduplication after attributes are extracted
-                # # This now handles BOTH batch-internal dedup AND database dedup in one pass
-                # final_hydrated_nodes, semantic_uuid_map = await semantic_dedupe_nodes_bulk(
-                #     self.clients,
-                #     final_hydrated_nodes,
-                #     entity_types,
-                #     db_candidates_by_type,
-                # )
-                #
-                # # Merge uuid maps from deterministic dedup and semantic dedup
-                # final_uuid_map.update(semantic_uuid_map)
-                # ========== END COMMENTED OUT ==========
+                # EasyOps: Two-round Map-Reduce semantic deduplication (with summary)
+                # Each batch searches its own DB candidates, one LLM call per batch
+                final_hydrated_nodes, semantic_uuid_map = await semantic_dedupe_nodes_bulk(
+                    self.clients,
+                    final_hydrated_nodes,
+                    entity_types,
+                )
+
+                # Merge uuid maps from deterministic dedup and semantic dedup
+                final_uuid_map.update(semantic_uuid_map)
 
                 # Resolved pointers for episodic edges (apply uuid map from LLM dedup)
                 resolved_episodic_edges = resolve_edge_pointers(episodic_edges, final_uuid_map)

@@ -96,11 +96,36 @@ class NodeResolutionsWithScores(BaseModel):
     )
 
 
+# Clustering-based deduplication models (EasyOps)
+class EntityGroup(BaseModel):
+    """A group of entities that refer to the same real-world object."""
+
+    entity_ids: list[int] = Field(
+        ..., description='IDs of entities in this group (from ENTITIES list)'
+    )
+    canonical_id: int = Field(
+        ..., description='ID of the entity with the best/most complete name'
+    )
+    reasoning: str = Field(
+        default='', description='Why these entities are the same'
+    )
+
+
+class EntityClustering(BaseModel):
+    """Clustering result for entity deduplication."""
+
+    groups: list[EntityGroup] = Field(
+        ...,
+        description='Groups of duplicate entities. Single entities should also be in their own group.',
+    )
+
+
 class Prompt(Protocol):
     node: PromptVersion
     node_list: PromptVersion
     nodes: PromptVersion
     nodes_with_scores: PromptVersion
+    cluster_entities: PromptVersion
 
 
 class Versions(TypedDict):
@@ -108,6 +133,7 @@ class Versions(TypedDict):
     node_list: PromptFunction
     nodes: PromptFunction
     nodes_with_scores: PromptFunction
+    cluster_entities: PromptFunction
 
 
 def node(context: dict[str, Any]) -> list[Message]:
@@ -176,11 +202,19 @@ def nodes(context: dict[str, Any]) -> list[Message]:
     # Build entity type definitions section if available
     type_defs = context.get('entity_type_definitions', {})
     type_defs_section = ''
+    alias_instruction = ''
     if type_defs:
         type_defs_section = f"""
         <ENTITY TYPE DEFINITIONS>
         {to_prompt_json(type_defs)}
         </ENTITY TYPE DEFINITIONS>
+        """
+        # EasyOps: Add explicit alias matching instruction when type definitions are available
+        alias_instruction = """
+        **IMPORTANT - ALIAS MATCHING**:
+        The ENTITY TYPE DEFINITIONS above may contain alias patterns using "或" (Chinese "or").
+        For example: "(5)EasyITSM 或 ITSM 或 IT服务中心" means EasyITSM, ITSM, and IT服务中心 are ALL aliases for the SAME entity.
+        When you see entities with names matching these aliases, they MUST be marked as duplicates.
         """
 
     return [
@@ -206,7 +240,9 @@ def nodes(context: dict[str, Any]) -> list[Message]:
         {{
             id: integer id of the entity,
             name: "name of the entity",
-            entity_type: ["Entity", "<optional additional label>", ...]
+            summary: "brief description of the entity",
+            entity_type: ["Entity", "<optional additional label>", ...],
+            entity_type_description: "description of the entity type, may contain alias patterns"
         }}
 
         <ENTITIES>
@@ -221,14 +257,15 @@ def nodes(context: dict[str, Any]) -> list[Message]:
         {{
             idx: integer index of the candidate entity (use this when referencing a duplicate),
             name: "name of the candidate entity",
+            summary: "brief description of the candidate entity",
             entity_types: ["Entity", "<optional additional label>", ...],
-            ...<additional attributes such as summaries or metadata>
+            ...<additional attributes such as code, module_name, or other metadata>
         }}
 
         For each of the above ENTITIES, determine if the entity is a duplicate of any of the EXISTING ENTITIES.
 
         Entities should only be considered duplicates if they refer to the *same real-world object or concept*.
-
+        {alias_instruction}
         Do NOT mark entities as duplicates if:
         - They are related but distinct.
         - They have similar names or purposes but refer to separate instances or concepts.
@@ -391,4 +428,66 @@ def nodes_with_scores(context: dict[str, Any]) -> list[Message]:
     ]
 
 
-versions: Versions = {'node': node, 'node_list': node_list, 'nodes': nodes, 'nodes_with_scores': nodes_with_scores}
+def cluster_entities(context: dict[str, Any]) -> list[Message]:
+    """Cluster entities into groups where each group represents the same real-world entity.
+
+    EasyOps: This approach avoids the self-matching problem in batch deduplication
+    by asking the LLM to group entities instead of comparing them pairwise.
+    """
+    entity_type = context.get('entity_type', 'Entity')
+    type_definition = context.get('type_definition', '')
+
+    type_def_section = ''
+    if type_definition:
+        type_def_section = f"""
+<TYPE DEFINITION>
+{entity_type}: "{type_definition}"
+</TYPE DEFINITION>
+"""
+
+    return [
+        Message(
+            role='system',
+            content='You are a helpful assistant that groups entities by identity. '
+            'Entities that refer to the SAME real-world object should be in the same group.',
+        ),
+        Message(
+            role='user',
+            content=f"""
+You are grouping entities of type "{entity_type}".
+Entities referring to the SAME real-world object should be in the same group.
+
+{type_def_section}
+
+<ENTITIES>
+{to_prompt_json(context['entities'])}
+</ENTITIES>
+
+Each entity has:
+- id: unique identifier
+- name: entity name
+- summary: description of the entity
+
+**TASK**: Group entities that refer to the SAME real-world object.
+- Abbreviations, translations, or variations of the same name are the SAME entity
+- Different objects, even if similar in nature, are DIFFERENT entities
+
+**RULES**:
+1. Check the TYPE DEFINITION for explicit alias patterns
+2. Consider summary similarity - same functionality/description = likely same entity
+3. Single entities with no duplicates should be in their own group
+4. Every entity ID must appear in exactly ONE group
+
+**OUTPUT**: Return groups, where each group contains entity_ids and the canonical_id (the one with the best/most complete name).
+""",
+        ),
+    ]
+
+
+versions: Versions = {
+    'node': node,
+    'node_list': node_list,
+    'nodes': nodes,
+    'nodes_with_scores': nodes_with_scores,
+    'cluster_entities': cluster_entities,
+}
