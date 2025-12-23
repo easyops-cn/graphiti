@@ -43,10 +43,19 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
                 RETURN n.uuid AS uuid
             """
         case GraphProvider.FALKORDB:
+            # Use SET directly with vecf32() for vector properties
             return """
                 MERGE (n:Episodic {uuid: $uuid})
-                SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
+                SET n.uuid = $uuid, n.name = $name, n.group_id = $group_id,
+                    n.source_description = $source_description, n.source = $source,
+                    n.content = $content, n.entity_edges = $entity_edges,
+                    n.created_at = $created_at, n.valid_at = $valid_at,
+                    n.summary = $summary, n.tags = $tags,
+                    n.content_embedding = CASE
+                        WHEN $content_embedding IS NOT NULL AND size($content_embedding) > 0
+                        THEN vecf32($content_embedding)
+                        ELSE NULL
+                    END
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
@@ -110,7 +119,9 @@ EPISODIC_NODE_RETURN = """
     e.source_description AS source_description,
     e.content AS content,
     e.valid_at AS valid_at,
-    e.entity_edges AS entity_edges
+    e.entity_edges AS entity_edges,
+    e.summary AS summary,
+    e.tags AS tags
 """
 
 EPISODIC_NODE_RETURN_NEPTUNE = """
@@ -122,7 +133,9 @@ EPISODIC_NODE_RETURN_NEPTUNE = """
     e.group_id AS group_id,
     e.source_description AS source_description,
     e.source AS source,
-    split(e.entity_edges, ",") AS entity_edges
+    split(e.entity_edges, ",") AS entity_edges,
+    e.summary AS summary,
+    split(e.tags, "|") AS tags
 """
 
 

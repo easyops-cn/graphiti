@@ -309,6 +309,20 @@ class EpisodicNode(Node):
         default_factory=list,
     )
 
+    # Document mode fields (EasyOps extension)
+    summary: str | None = Field(
+        default=None,
+        description='LLM-generated summary of the document content (document mode only)',
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description='LLM-extracted tags/keywords from the document (document mode only)',
+    )
+    content_embedding: list[float] | None = Field(
+        default=None,
+        description='Vector embedding of the content for semantic search (document mode only)',
+    )
+
     async def save(self, driver: GraphDriver):
         if driver.graph_operations_interface:
             return await driver.graph_operations_interface.episodic_node_save(self, driver)
@@ -323,6 +337,10 @@ class EpisodicNode(Node):
             'created_at': self.created_at,
             'valid_at': self.valid_at,
             'source': self.source.value,
+            # Document mode fields
+            'summary': self.summary,
+            'tags': self.tags or [],
+            'content_embedding': self.content_embedding,
         }
 
         result = await driver.execute_query(
@@ -769,6 +787,9 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
         name=record['name'],
         source_description=record['source_description'],
         entity_edges=record['entity_edges'],
+        # Document mode fields
+        summary=record.get('summary'),
+        tags=record.get('tags'),
     )
 
 
