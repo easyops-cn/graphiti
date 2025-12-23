@@ -362,6 +362,67 @@ async def semantic_dedupe_nodes_bulk(
     return final_deduped_nodes, uuid_map
 
 
+def _redirect_to_db_canonical(
+    pairs: list[tuple[str, str]],
+    extracted_uuids: set[str],
+    db_uuids: set[str],
+) -> list[tuple[str, str]]:
+    """Redirect pairs to use DB node as canonical when available.
+
+    EasyOps fix: When LLM chooses an extracted node as canonical but a DB node
+    exists in the same group (indicated by DB->extracted pair), we should
+    redirect all pairs pointing to that extracted node to point to the DB node
+    instead. This ensures extracted nodes are properly deduplicated against
+    existing DB entities.
+
+    Example:
+    - Input pairs: [(ext1, ext2), (db1, ext2)]  # LLM chose ext2 as canonical
+    - Output pairs: [(ext1, db1), (db1, db1)]   # Redirect to db1
+    - After filtering (only keep extracted->*): [(ext1, db1)]
+    """
+    if not pairs:
+        return pairs
+
+    # Find extracted nodes that should be redirected to DB nodes
+    # If (db_uuid, extracted_uuid) exists, it means they're the same entity
+    # but LLM wrongly chose extracted as canonical
+    db_for_extracted: dict[str, str] = {}
+    for src, tgt in pairs:
+        if src in db_uuids and tgt in extracted_uuids:
+            # DB node points to extracted node - remember this mapping
+            # If multiple DB nodes point to same extracted, use the first one
+            if tgt not in db_for_extracted:
+                db_for_extracted[tgt] = src
+                logger.info(
+                    '[redirect_canonical] Redirecting extracted canonical "%s" to DB node "%s"',
+                    tgt, src,
+                )
+
+    if not db_for_extracted:
+        return pairs
+
+    # Redirect all pairs to use DB node as canonical
+    redirected_pairs: list[tuple[str, str]] = []
+    for src, tgt in pairs:
+        new_tgt = db_for_extracted.get(tgt, tgt)
+        if src != new_tgt:  # Don't create self-loop
+            redirected_pairs.append((src, new_tgt))
+
+    # IMPORTANT: Add pairs for extracted canonicals that got redirected
+    # These nodes were chosen as canonical by LLM but need to be mapped to DB nodes
+    # Without this, the extracted canonical would not be in uuid_map
+    for ext_canonical, db_canonical in db_for_extracted.items():
+        pair = (ext_canonical, db_canonical)
+        if pair not in redirected_pairs:
+            redirected_pairs.append(pair)
+            logger.info(
+                '[redirect_canonical] Added pair for redirected canonical: "%s" -> "%s"',
+                ext_canonical, db_canonical,
+            )
+
+    return redirected_pairs
+
+
 async def _cluster_entity_type_with_batching(
     clients: GraphitiClients,
     type_nodes: list[EntityNode],
@@ -409,6 +470,8 @@ async def _cluster_entity_type_with_batching(
         all_pairs = await _cluster_entities_with_llm(
             clients.llm_client, all_nodes, entity_type, type_definition
         )
+        # Redirect extracted canonical to DB node when both exist in same group
+        all_pairs = _redirect_to_db_canonical(all_pairs, extracted_uuids, db_uuids)
         # Filter: only return pairs where source is an extracted node
         return [(src, tgt) for src, tgt in all_pairs if src in extracted_uuids]
 
@@ -456,6 +519,9 @@ async def _cluster_entity_type_with_batching(
             clients.llm_client, canonical_nodes, entity_type, type_definition
         )
         all_pairs.extend(reduce_pairs)
+
+    # Redirect extracted canonical to DB node when both exist in same group
+    all_pairs = _redirect_to_db_canonical(all_pairs, extracted_uuids, db_uuids)
 
     # Filter: only return pairs where source is an extracted node (not a DB node)
     filtered_pairs = [(src, tgt) for src, tgt in all_pairs if src in extracted_uuids]

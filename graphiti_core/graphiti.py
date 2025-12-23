@@ -532,91 +532,52 @@ class Graphiti:
             ]
         )
 
-        # EasyOps: Disabled filter_extracted_nodes - now using Top 3 scoring + second-pass resolution
-        # The two-step validation (validate_entity_types + reclassify) is redundant with new approach
-        # ========== BEGIN COMMENTED OUT ==========
-        # # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
-        # entity_types_context = [
-        #     {
-        #         'entity_type_id': 0,
-        #         'entity_type_name': 'Entity',
-        #         'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
-        #     }
-        # ]
-        # if entity_types:
-        #     entity_types_context += [
-        #         {
-        #             'entity_type_id': i + 1,
-        #             'entity_type_name': type_name,
-        #             'entity_type_description': type_model.__doc__,
-        #         }
-        #         for i, (type_name, type_model) in enumerate(entity_types.items())
-        #     ]
-        #
-        # # Filter each episode's nodes in parallel
-        # filter_results: list[tuple[list[str], list]] = await semaphore_gather(
-        #     *[
-        #         filter_extracted_nodes(
-        #             self.llm_client,
-        #             episode,
-        #             hydrated_nodes_results[i],
-        #             episode.group_id,
-        #             entity_types_context,
-        #         )
-        #         for i, (episode, _) in enumerate(episode_context)
-        #     ]
-        # )
-        #
-        # # Collect all entities to remove and reclassify
-        # all_entities_to_remove: set[str] = set()
-        # all_reclassifications: dict[str, tuple[str, str]] = {}  # name -> (new_type, reason)
-        # for entities_to_remove, entities_to_reclassify in filter_results:
-        #     all_entities_to_remove.update(entities_to_remove)
-        #     for reclass in entities_to_reclassify:
-        #         all_reclassifications[reclass.name] = (reclass.new_type, reclass.reason)
-        #
-        # # Apply reclassifications to nodes
-        # if all_reclassifications:
-        #     for nodes in hydrated_nodes_results:
-        #         for node in nodes:
-        #             if node.name in all_reclassifications:
-        #                 new_type, reason = all_reclassifications[node.name]
-        #                 old_labels = node.labels.copy()
-        #                 # Update labels: keep 'Entity', replace specific type
-        #                 node.labels = ['Entity', new_type] if new_type != 'Entity' else ['Entity']
-        #
-        #                 # Clear attributes not belonging to new type schema
-        #                 # This prevents attribute pollution when reclassifying from one type to another
-        #                 if entity_types and new_type in entity_types:
-        #                     new_type_model = entity_types[new_type]
-        #                     valid_fields = set(new_type_model.model_fields.keys())
-        #                     old_attrs = node.attributes.copy()
-        #                     node.attributes = {k: v for k, v in node.attributes.items() if k in valid_fields}
-        #                     if old_attrs != node.attributes:
-        #                         removed_attrs = set(old_attrs.keys()) - set(node.attributes.keys())
-        #                         logger.info(f'[bulk_reclassify] Cleared invalid attributes from "{node.name}": {removed_attrs}')
-        #                 elif new_type == 'Entity':
-        #                     # Reclassified to generic Entity, clear all custom attributes
-        #                     if node.attributes:
-        #                         logger.info(f'[bulk_reclassify] Cleared all attributes from "{node.name}" (reclassified to Entity)')
-        #                         node.attributes = {}
-        #
-        #                 # Update reasoning with reclassification reason
-        #                 node.reasoning = f'[Reclassified from {old_labels} to {node.labels}] {reason}'
-        #                 logger.info(f'[bulk_reclassify] Reclassified "{node.name}": {old_labels} -> {node.labels}, reason: {reason}')
-        #
-        # if all_entities_to_remove:
-        #     # Filter nodes in each episode's results
-        #     filtered_hydrated_nodes_results: list[list[EntityNode]] = []
-        #     for nodes in hydrated_nodes_results:
-        #         filtered_nodes = [n for n in nodes if n.name not in all_entities_to_remove]
-        #         filtered_hydrated_nodes_results.append(filtered_nodes)
-        #     hydrated_nodes_results = filtered_hydrated_nodes_results
-        #     logger.info(f'[bulk_filter] Filtered {len(all_entities_to_remove)} entities: {list(all_entities_to_remove)}')
-        # ========== END COMMENTED OUT ==========
+        # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+        # EasyOps: Restored filter_extracted_nodes - Step 2 (reclassify) is disabled in node_operations.py
+        entity_types_context = [
+            {
+                'entity_type_id': 0,
+                'entity_type_name': 'Entity',
+                'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+            }
+        ]
+        if entity_types:
+            entity_types_context += [
+                {
+                    'entity_type_id': i + 1,
+                    'entity_type_name': type_name,
+                    'entity_type_description': type_model.__doc__,
+                }
+                for i, (type_name, type_model) in enumerate(entity_types.items())
+            ]
 
-        # Since filter step is disabled, no entities are removed
+        # Filter each episode's nodes in parallel
+        filter_results: list[tuple[list[str], list]] = await semaphore_gather(
+            *[
+                filter_extracted_nodes(
+                    self.llm_client,
+                    episode,
+                    hydrated_nodes_results[i],
+                    episode.group_id,
+                    entity_types_context,
+                )
+                for i, (episode, _) in enumerate(episode_context)
+            ]
+        )
+
+        # Collect all entities to remove (reclassify is disabled)
         all_entities_to_remove: set[str] = set()
+        for entities_to_remove, _ in filter_results:
+            all_entities_to_remove.update(entities_to_remove)
+
+        if all_entities_to_remove:
+            # Filter nodes in each episode's results
+            filtered_hydrated_nodes_results: list[list[EntityNode]] = []
+            for nodes in hydrated_nodes_results:
+                filtered_nodes = [n for n in nodes if n.name not in all_entities_to_remove]
+                filtered_hydrated_nodes_results.append(filtered_nodes)
+            hydrated_nodes_results = filtered_hydrated_nodes_results
+            logger.info(f'[bulk_filter] Filtered {len(all_entities_to_remove)} entities: {list(all_entities_to_remove)}')
 
         final_hydrated_nodes = [node for nodes in hydrated_nodes_results for node in nodes]
 
@@ -891,82 +852,49 @@ class Graphiti:
                 )
                 perf_logger.info(f'[PERF] resolve_edges + extract_attrs (parallel): {(time() - step_start)*1000:.0f}ms, resolved={len(resolved_edges)}, invalidated={len(invalidated_edges)}')
 
-                # EasyOps: Disabled filter_extracted_nodes - now using Top 3 scoring + second-pass resolution
-                # The two-step validation (validate_entity_types + reclassify) is redundant with new approach
-                # ========== BEGIN COMMENTED OUT ==========
-                # # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
-                # step_start = time()
-                # entity_types_context = [
-                #     {
-                #         'entity_type_id': 0,
-                #         'entity_type_name': 'Entity',
-                #         'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
-                #     }
-                # ]
-                # if entity_types:
-                #     entity_types_context += [
-                #         {
-                #             'entity_type_id': i + 1,
-                #             'entity_type_name': type_name,
-                #             'entity_type_description': type_model.__doc__,
-                #         }
-                #         for i, (type_name, type_model) in enumerate(entity_types.items())
-                #     ]
-                # entities_to_remove, entities_to_reclassify = await filter_extracted_nodes(
-                #     self.llm_client,
-                #     episode,
-                #     hydrated_nodes,
-                #     group_id,
-                #     entity_types_context,
-                # )
-                #
-                # # Apply reclassifications to nodes
-                # if entities_to_reclassify:
-                #     # Store both new_type and reason for updating node.reasoning
-                #     reclassify_map = {r.name: (r.new_type, r.reason) for r in entities_to_reclassify}
-                #     for node in hydrated_nodes:
-                #         if node.name in reclassify_map:
-                #             new_type, reason = reclassify_map[node.name]
-                #             old_labels = node.labels.copy()
-                #             node.labels = ['Entity', new_type] if new_type != 'Entity' else ['Entity']
-                #
-                #             # Clear attributes not belonging to new type schema
-                #             # This prevents attribute pollution when reclassifying from one type to another
-                #             if entity_types and new_type in entity_types:
-                #                 new_type_model = entity_types[new_type]
-                #                 valid_fields = set(new_type_model.model_fields.keys())
-                #                 old_attrs = node.attributes.copy()
-                #                 node.attributes = {k: v for k, v in node.attributes.items() if k in valid_fields}
-                #                 if old_attrs != node.attributes:
-                #                     removed_attrs = set(old_attrs.keys()) - set(node.attributes.keys())
-                #                     logger.info(f'Cleared invalid attributes from "{node.name}": {removed_attrs}')
-                #             elif new_type == 'Entity':
-                #                 # Reclassified to generic Entity, clear all custom attributes
-                #                 if node.attributes:
-                #                     logger.info(f'Cleared all attributes from "{node.name}" (reclassified to Entity)')
-                #                     node.attributes = {}
-                #
-                #             # Update reasoning with reclassification reason
-                #             node.reasoning = f'[Reclassified from {old_labels} to {node.labels}] {reason}'
-                #             logger.info(f'Reclassified "{node.name}": {old_labels} -> {node.labels}, reason: {reason}')
-                #
-                # if entities_to_remove:
-                #     entities_to_remove_set = set(entities_to_remove)
-                #     original_count = len(hydrated_nodes)
-                #     hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
-                #     # Also filter edges that reference removed nodes
-                #     removed_uuids = {n.uuid for n in nodes if n.name in entities_to_remove_set}
-                #     resolved_edges = [
-                #         e for e in resolved_edges
-                #         if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
-                #     ]
-                #     invalidated_edges = [
-                #         e for e in invalidated_edges
-                #         if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
-                #     ]
-                #     logger.info(f'Filtered {original_count - len(hydrated_nodes)} entities: {entities_to_remove}')
-                # perf_logger.info(f'[PERF] filter_entities: {(time() - step_start)*1000:.0f}ms, removed={len(entities_to_remove)}, reclassified={len(entities_to_reclassify)}')
-                # ========== END COMMENTED OUT ==========
+                # Filter entities using Knowledge Graph Builder's Principles (after attributes/summary extracted)
+                # EasyOps: Restored filter_extracted_nodes - Step 2 (reclassify) is disabled in node_operations.py
+                step_start = time()
+                entity_types_context = [
+                    {
+                        'entity_type_id': 0,
+                        'entity_type_name': 'Entity',
+                        'entity_type_description': 'Default entity classification. Use this entity type if the entity is not one of the other listed types.',
+                    }
+                ]
+                if entity_types:
+                    entity_types_context += [
+                        {
+                            'entity_type_id': i + 1,
+                            'entity_type_name': type_name,
+                            'entity_type_description': type_model.__doc__,
+                        }
+                        for i, (type_name, type_model) in enumerate(entity_types.items())
+                    ]
+                entities_to_remove, _ = await filter_extracted_nodes(
+                    self.llm_client,
+                    episode,
+                    hydrated_nodes,
+                    group_id,
+                    entity_types_context,
+                )
+
+                if entities_to_remove:
+                    entities_to_remove_set = set(entities_to_remove)
+                    original_count = len(hydrated_nodes)
+                    hydrated_nodes = [n for n in hydrated_nodes if n.name not in entities_to_remove_set]
+                    # Also filter edges that reference removed nodes
+                    removed_uuids = {n.uuid for n in nodes if n.name in entities_to_remove_set}
+                    resolved_edges = [
+                        e for e in resolved_edges
+                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                    ]
+                    invalidated_edges = [
+                        e for e in invalidated_edges
+                        if e.source_node_uuid not in removed_uuids and e.target_node_uuid not in removed_uuids
+                    ]
+                    logger.info(f'Filtered {original_count - len(hydrated_nodes)} entities: {entities_to_remove}')
+                perf_logger.info(f'[PERF] filter_entities: {(time() - step_start)*1000:.0f}ms, removed={len(entities_to_remove)}')
 
                 entity_edges = resolved_edges + invalidated_edges
 

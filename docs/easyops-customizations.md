@@ -48,6 +48,7 @@
 | `graphiti_core/utils/maintenance/node_operations.py` | 逻辑修改 | **两阶段类型分类：Top 3 打分 + 歧义消解** |
 | `graphiti_core/utils/maintenance/node_operations.py` | 性能优化 | **实体去重分批并行处理，避免 LLM 输出截断** |
 | `graphiti_core/helpers.py` | Bug修复 | **lucene_sanitize 添加反引号转义，修复 RediSearch 语法错误** |
+| `graphiti_core/utils/maintenance/node_operations.py` | 容错处理 | **_extract_attributes_and_update 添加异常捕获，单实体失败不影响整批** |
 | `graphiti_core/utils/bulk_utils.py` | **Bug修复** | **批量去重传递 entity_type_definitions，启用别名匹配** |
 | `graphiti_core/prompts/dedupe_nodes.py` | **Prompt增强** | **nodes() 添加别名匹配指导，识别 "或" 分隔的别名** |
 | `graphiti_core/prompts/extract_nodes.py` | **功能增强** | **反思环节增加负向反思：识别不该抽取的实体、类型错误的实体** |
@@ -57,6 +58,7 @@
 | `graphiti_core/prompts/extract_nodes.py` | **性能优化** | **批量 Summary 提取：EntitySummaries 模型 + extract_summaries_bulk 提示词** |
 | `graphiti_core/utils/maintenance/node_operations.py` | **性能优化** | **_extract_entity_summaries_bulk 批量提取 + extract_attributes_from_nodes 改用批量** |
 | `scripts/cleanup_duplicate_nodes.py` | **新增脚本** | **离线清理重复节点：用 LLM 识别并合并数据库中的历史重复数据** |
+| `graphiti_core/prompts/dedupe_nodes.py` | **Prompt增强** | **cluster_entities() 防止相反操作被错误分组（backup vs restore）** |
 
 ---
 
@@ -3145,3 +3147,60 @@ LLM 现在能够：
 |-----|---------|
 | `graphiti_core/utils/bulk_utils.py` | `_resolve_batch_with_llm()` 构建并传递 `entity_type_definitions` |
 | `graphiti_core/prompts/dedupe_nodes.py` | `nodes()` 添加 `alias_instruction` 和更完整的实体结构描述 |
+
+---
+
+## 28. 实体聚类去重：防止相反操作被错误分组（Cluster Entities Anti-Grouping）
+
+### 问题背景
+
+批量去重使用 `cluster_entities` 提示词时，LLM 输出自相矛盾的结果：
+
+**具体案例**：
+
+```json
+{
+  "entity_ids": [14, 33],
+  "canonical_id": 14,
+  "reasoning": "data_backup与data_restore为互为反向操作，分别用于备份与恢复easy_core数据，功能相反，不视为同一实体。"
+}
+```
+
+**问题**：reasoning 明确说"功能相反，不视为同一实体"，但却将两个实体分到同一组，导致 `data_backup` 和 `data_restore` 被错误合并。
+
+### 解决方案
+
+**文件**: `graphiti_core/prompts/dedupe_nodes.py`
+
+在 `cluster_entities()` 函数中增强提示词：
+
+1. **添加 CRITICAL 规则**：明确列出不应分组的情况
+2. **增加一致性检查要求**：reasoning 必须与分组决策一致
+
+```python
+**CRITICAL - DO NOT GROUP THESE**:
+- Inverse/opposite operations: backup vs restore, create vs delete, import vs export
+- Related but distinct concepts: request vs response, start vs stop, enable vs disable
+- Different instances: server1 vs server2, config_a vs config_b
+- Parent-child relationships: system vs subsystem, module vs submodule
+
+If entities have OPPOSITE or COMPLEMENTARY functions, they are DIFFERENT entities - put each in its OWN group.
+
+**RULES**:
+...
+5. **Your reasoning MUST be consistent with the grouping** - if reasoning says entities are "not the same" or "different", they must be in SEPARATE groups
+```
+
+### 效果
+
+| 实体对 | 修复前 | 修复后 |
+|-------|-------|-------|
+| `data_backup` vs `data_restore` | 错误分到同一组 | 各自独立分组 |
+| `create_xxx` vs `delete_xxx` | 可能被错误合并 | 各自独立分组 |
+| `import_data` vs `export_data` | 可能被错误合并 | 各自独立分组 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/prompts/dedupe_nodes.py` | `cluster_entities()` 添加 CRITICAL 规则和 reasoning 一致性要求 |

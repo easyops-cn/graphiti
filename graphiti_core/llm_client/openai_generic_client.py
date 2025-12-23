@@ -329,9 +329,15 @@ class OpenAIGenericClient(LLMClient):
                     logger.error(f'[LLM] Could not read response body')
             if hasattr(e, 'body') and e.body is not None:
                 logger.error(f'[LLM] Error body: {e.body}')
+            # Log request info for debugging large prompts
+            total_chars = sum(len(str(m.get('content', ''))) for m in openai_messages)
+            logger.error(f'[LLM] Request info: num_messages={len(openai_messages)}, total_chars={total_chars}')
             raise
         except Exception as e:
             logger.error(f'Error in generating LLM response: {e}')
+            # Also log request size for unexpected errors
+            total_chars = sum(len(str(m.get('content', ''))) for m in openai_messages)
+            logger.error(f'[LLM] Request info on error: num_messages={len(openai_messages)}, total_chars={total_chars}')
             raise
 
     def _fix_common_json_errors(self, data: Any, response_model: type[BaseModel]) -> Any:
@@ -395,9 +401,19 @@ class OpenAIGenericClient(LLMClient):
                     openai.APITimeoutError,
                     openai.APIConnectionError,
                     openai.InternalServerError,
-                ):
+                ) as e:
+                    # Log server errors for debugging
+                    logger.error(f'[LLM] Server error (will be retried by client): {type(e).__name__}: {e}')
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            response_text = e.response.text if hasattr(e.response, 'text') else str(e.response)
+                            logger.error(f'[LLM] Server error response body: {response_text}')
+                        except Exception:
+                            pass
+                    if hasattr(e, 'body') and e.body is not None:
+                        logger.error(f'[LLM] Server error body: {e.body}')
                     # Let OpenAI's client handle these retries
-                    span.set_status('error', str(last_error))
+                    span.set_status('error', str(e))
                     raise
                 except Exception as e:
                     last_error = e

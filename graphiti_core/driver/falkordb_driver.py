@@ -346,6 +346,7 @@ class FalkorDriver(GraphDriver):
                 '|': ' ',  # RediSearch OR operator
                 '/': ' ',  # Path separator, can cause issues
                 '\\': ' ', # Backslash
+                '_': ' ',  # Underscore - avoid standalone _ token in fulltext query
             }
         )
         sanitized = query.translate(separator_map)

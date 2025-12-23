@@ -220,77 +220,83 @@ async def filter_extracted_nodes(
         logger.info('[filter] All entities passed type validation')
         return [], []
 
-    # Step 2: Reclassify invalid entities using the production-validated extract_text prompt
-    # For each invalid entity, use its name+summary as "text" and let LLM re-classify
-    entities_to_remove: list[str] = []
-    entities_to_reclassify: list[EntityReclassification] = []
+    # EasyOps: Step 2 (reclassify) is disabled - invalid entities are directly removed
+    # Collect all invalid entity names for removal
+    entities_to_remove: list[str] = [entity['name'] for entity in invalid_entities]
+    logger.info(f'[filter] Removing {len(entities_to_remove)} invalid entities: {entities_to_remove}')
 
-    async def reclassify_entity(entity: dict) -> tuple[str, str | None, str]:
-        """Reclassify a single entity using extract_text prompt.
+    # ========== BEGIN COMMENTED OUT - Step 2: Reclassify ==========
+    # # Step 2: Reclassify invalid entities using the production-validated extract_text prompt
+    # # For each invalid entity, use its name+summary as "text" and let LLM re-classify
+    # entities_to_reclassify: list[EntityReclassification] = []
+    #
+    # async def reclassify_entity(entity: dict) -> tuple[str, str | None, str]:
+    #     """Reclassify a single entity using extract_text prompt.
+    #
+    #     Returns: (name, new_type or None, reasoning)
+    #     """
+    #     # EasyOps fix: Use full episode content for reclassification context
+    #     # instead of just name+summary, to preserve critical context
+    #     reclassify_context = {
+    #         'episode_content': episode.content,  # Full episode context
+    #         'entity_types': entity_types_context,  # Full schema types
+    #         # NOTE: Do NOT include validation_reason here - it may contain type suggestions
+    #         # that would bias the LLM. Let extract_text make an independent classification.
+    #         'custom_prompt': f"Focus on the entity '{entity['name']}' (description: {entity['summary']}). "
+    #                        f"It was previously classified as '{entity['assigned_type']}' "
+    #                        f"but that classification may be incorrect. "
+    #                        f"Re-read the full episode content and determine the correct entity type "
+    #                        f"from the available types based on how '{entity['name']}' is described in context.",
+    #     }
+    #
+    #     llm_response = await llm_client.generate_response(
+    #         prompt_library.extract_nodes.extract_text(reclassify_context),
+    #         ExtractedEntities,
+    #         group_id=group_id,
+    #         prompt_name='extract_nodes.extract_text_reclassify',
+    #     )
+    #
+    #     result = ExtractedEntities(**llm_response)
+    #
+    #     if not result.extracted_entities:
+    #         # LLM didn't extract anything - entity should be removed
+    #         return entity['name'], None, 'No valid entity type found during reclassification'
+    #
+    #     # Get the first extracted entity's classification
+    #     extracted = result.extracted_entities[0]
+    #     type_id = extracted.entity_type_id
+    #     reasoning = extracted.reasoning if hasattr(extracted, 'reasoning') else ''
+    #
+    #     # Map type_id back to type name
+    #     if 0 <= type_id < len(entity_types_context):
+    #         new_type_name = entity_types_context[type_id].get('entity_type_name', 'Entity')
+    #     else:
+    #         new_type_name = 'Entity'
+    #
+    #     # If still Entity or same as failed type, remove it
+    #     if new_type_name == 'Entity' or new_type_name == entity['assigned_type']:
+    #         return entity['name'], None, f'Reclassified as {new_type_name}, still invalid. {reasoning}'
+    #
+    #     return entity['name'], new_type_name, reasoning
+    #
+    # # Run reclassification in parallel
+    # reclassify_results = await semaphore_gather(
+    #     *[reclassify_entity(entity) for entity in invalid_entities]
+    # )
+    #
+    # # Process results
+    # for name, new_type, reasoning in reclassify_results:
+    #     if new_type is None:
+    #         entities_to_remove.append(name)
+    #         logger.info(f'[filter_step2] Removing "{name}": {reasoning}')
+    #     else:
+    #         entities_to_reclassify.append(
+    #             EntityReclassification(name=name, new_type=new_type, reason=reasoning)
+    #         )
+    #         logger.info(f'[filter_step2] Reclassifying "{name}" to "{new_type}": {reasoning}')
+    # ========== END COMMENTED OUT ==========
 
-        Returns: (name, new_type or None, reasoning)
-        """
-        # EasyOps fix: Use full episode content for reclassification context
-        # instead of just name+summary, to preserve critical context
-        reclassify_context = {
-            'episode_content': episode.content,  # Full episode context
-            'entity_types': entity_types_context,  # Full schema types
-            # NOTE: Do NOT include validation_reason here - it may contain type suggestions
-            # that would bias the LLM. Let extract_text make an independent classification.
-            'custom_prompt': f"Focus on the entity '{entity['name']}' (description: {entity['summary']}). "
-                           f"It was previously classified as '{entity['assigned_type']}' "
-                           f"but that classification may be incorrect. "
-                           f"Re-read the full episode content and determine the correct entity type "
-                           f"from the available types based on how '{entity['name']}' is described in context.",
-        }
-
-        llm_response = await llm_client.generate_response(
-            prompt_library.extract_nodes.extract_text(reclassify_context),
-            ExtractedEntities,
-            group_id=group_id,
-            prompt_name='extract_nodes.extract_text_reclassify',
-        )
-
-        result = ExtractedEntities(**llm_response)
-
-        if not result.extracted_entities:
-            # LLM didn't extract anything - entity should be removed
-            return entity['name'], None, 'No valid entity type found during reclassification'
-
-        # Get the first extracted entity's classification
-        extracted = result.extracted_entities[0]
-        type_id = extracted.entity_type_id
-        reasoning = extracted.reasoning if hasattr(extracted, 'reasoning') else ''
-
-        # Map type_id back to type name
-        if 0 <= type_id < len(entity_types_context):
-            new_type_name = entity_types_context[type_id].get('entity_type_name', 'Entity')
-        else:
-            new_type_name = 'Entity'
-
-        # If still Entity or same as failed type, remove it
-        if new_type_name == 'Entity' or new_type_name == entity['assigned_type']:
-            return entity['name'], None, f'Reclassified as {new_type_name}, still invalid. {reasoning}'
-
-        return entity['name'], new_type_name, reasoning
-
-    # Run reclassification in parallel
-    reclassify_results = await semaphore_gather(
-        *[reclassify_entity(entity) for entity in invalid_entities]
-    )
-
-    # Process results
-    for name, new_type, reasoning in reclassify_results:
-        if new_type is None:
-            entities_to_remove.append(name)
-            logger.info(f'[filter_step2] Removing "{name}": {reasoning}')
-        else:
-            entities_to_reclassify.append(
-                EntityReclassification(name=name, new_type=new_type, reason=reasoning)
-            )
-            logger.info(f'[filter_step2] Reclassifying "{name}" to "{new_type}": {reasoning}')
-
-    return entities_to_remove, entities_to_reclassify
+    return entities_to_remove, []  # No reclassifications when Step 2 is disabled
 
 
 async def extract_nodes(
@@ -1081,11 +1087,23 @@ async def _extract_attributes_and_update(
     previous_episodes: list[EpisodicNode] | None,
     entity_type: type[BaseModel] | None,
 ) -> None:
-    """Extract attributes and update node in place."""
-    result = await _extract_entity_attributes(
-        llm_client, node, episode, previous_episodes, entity_type
-    )
-    node.attributes.update(result)
+    """Extract attributes and update node in place.
+
+    EasyOps: Added exception handling to prevent single entity failure from
+    affecting the entire batch. If attribute extraction fails, the node's
+    attributes remain unchanged and a warning is logged.
+    """
+    try:
+        result = await _extract_entity_attributes(
+            llm_client, node, episode, previous_episodes, entity_type
+        )
+        node.attributes.update(result)
+    except Exception as e:
+        # Log warning but don't crash - let the batch continue
+        logger.warning(
+            f'Failed to extract attributes for entity "{node.name}" '
+            f'(type: {node.labels}): {e}. Attributes will remain empty.'
+        )
 
 
 async def extract_attributes_from_node(

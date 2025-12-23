@@ -472,11 +472,20 @@ Each entity has:
 - Abbreviations, translations, or variations of the same name are the SAME entity
 - Different objects, even if similar in nature, are DIFFERENT entities
 
+**CRITICAL - DO NOT GROUP THESE**:
+- Inverse/opposite operations: backup vs restore, create vs delete, import vs export
+- Related but distinct concepts: request vs response, start vs stop, enable vs disable
+- Different instances: server1 vs server2, config_a vs config_b
+- Parent-child relationships: system vs subsystem, module vs submodule
+
+If entities have OPPOSITE or COMPLEMENTARY functions, they are DIFFERENT entities - put each in its OWN group.
+
 **RULES**:
 1. Check the TYPE DEFINITION for explicit alias patterns
 2. Consider summary similarity - same functionality/description = likely same entity
 3. Single entities with no duplicates should be in their own group
 4. Every entity ID must appear in exactly ONE group
+5. **Your reasoning MUST be consistent with the grouping** - if reasoning says entities are "not the same" or "different", they must be in SEPARATE groups
 
 **OUTPUT**: Return groups, where each group contains entity_ids and the canonical_id (the one with the best/most complete name).
 """,
