@@ -16,5 +16,6 @@ limitations under the License.
 
 from .client import CrossEncoderClient
 from .openai_reranker_client import OpenAIRerankerClient
+from .qwen_reranker_client import QwenRerankerClient, QwenRerankerConfig
 
-__all__ = ['CrossEncoderClient', 'OpenAIRerankerClient']
+__all__ = ['CrossEncoderClient', 'OpenAIRerankerClient', 'QwenRerankerClient', 'QwenRerankerConfig']

@@ -731,6 +731,24 @@ async def node_similarity_search(
         else:
             return []
     else:
+        # 双向量 Max Score 策略：取 name_embedding 和 summary_embedding 的最大相似度
+        name_score_expr = get_vector_cosine_func_query('n.name_embedding', search_vector_var, driver.provider)
+
+        if driver.provider == GraphProvider.FALKORDB:
+            # FalkorDB: 使用 CASE WHEN 处理 summary_embedding 可能为 NULL 的情况
+            summary_score_expr = f"""
+                CASE WHEN n.summary_embedding IS NOT NULL
+                     THEN {get_vector_cosine_func_query('n.summary_embedding', search_vector_var, driver.provider)}
+                     ELSE 0.0 END"""
+            max_score_expr = f"""
+                CASE WHEN ({name_score_expr}) > ({summary_score_expr})
+                     THEN ({name_score_expr})
+                     ELSE ({summary_score_expr}) END"""
+        else:
+            # Neo4j/Kuzu: 使用 coalesce 处理 NULL
+            summary_score_expr = f"coalesce({get_vector_cosine_func_query('n.summary_embedding', search_vector_var, driver.provider)}, 0.0)"
+            max_score_expr = f"CASE WHEN ({name_score_expr}) > ({summary_score_expr}) THEN ({name_score_expr}) ELSE ({summary_score_expr}) END"
+
         query = (
             """
                                                                                                                                     MATCH (n:Entity)
@@ -738,7 +756,7 @@ async def node_similarity_search(
             + filter_query
             + """
             WITH n, """
-            + get_vector_cosine_func_query('n.name_embedding', search_vector_var, driver.provider)
+            + max_score_expr
             + """ AS score
             WHERE score > $min_score
             RETURN

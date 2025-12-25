@@ -457,6 +457,7 @@ class EpisodicNode(Node):
 
 class EntityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
+    summary_embedding: list[float] | None = Field(default=None, description='embedding of the summary for semantic search')
     summary: str = Field(description='regional summary of surrounding edges', default_factory=str)
     attributes: dict[str, Any] = Field(
         default={}, description='Additional attributes of the node. Dependent on node labels'
@@ -475,11 +476,26 @@ class EntityNode(Node):
     )
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
+        """生成 name_embedding 和 summary_embedding（双向量策略）
+
+        解决语义稀释问题：英文 name + 中文 summary 拼接会导致相似度下降。
+        分别存储两个向量，搜索时取 max(name_sim, summary_sim) 作为得分。
+        """
         start = time()
-        text = self.name.replace('\n', ' ')
-        self.name_embedding = await embedder.create(input_data=[text])
+
+        # name_embedding: 仅用 name 生成
+        name_text = self.name.replace('\n', ' ')
+        self.name_embedding = await embedder.create(input_data=[name_text])
+
+        # summary_embedding: 用 summary 生成（如果有 summary）
+        if self.summary:
+            summary_text = self.summary.replace('\n', ' ')
+            self.summary_embedding = await embedder.create(input_data=[summary_text])
+        else:
+            self.summary_embedding = None
+
         end = time()
-        logger.debug(f'embedded {text} in {end - start} ms')
+        logger.debug(f'embedded {name_text[:50]}... in {end - start} ms')
 
         return self.name_embedding
 
@@ -517,6 +533,7 @@ class EntityNode(Node):
             'uuid': self.uuid,
             'name': self.name,
             'name_embedding': self.name_embedding,
+            'summary_embedding': self.summary_embedding,
             'group_id': self.group_id,
             'summary': self.summary,
             'created_at': self.created_at,
@@ -856,12 +873,27 @@ def get_community_node_from_record(record: Any) -> CommunityNode:
 
 
 async def create_entity_node_embeddings(embedder: EmbedderClient, nodes: list[EntityNode]):
+    """批量生成实体节点的 name_embedding 和 summary_embedding（双向量策略）
+
+    解决语义稀释问题：英文 name + 中文 summary 拼接会导致相似度下降。
+    分别存储两个向量，搜索时取 max(name_sim, summary_sim) 作为得分。
+    """
     # filter out falsey values from nodes
     filtered_nodes = [node for node in nodes if node.name]
 
     if not filtered_nodes:
         return
 
-    name_embeddings = await embedder.create_batch([node.name for node in filtered_nodes])
+    # 1. 生成 name_embedding（仅用 name）
+    name_texts = [node.name for node in filtered_nodes]
+    name_embeddings = await embedder.create_batch(name_texts)
     for node, name_embedding in zip(filtered_nodes, name_embeddings, strict=True):
         node.name_embedding = name_embedding
+
+    # 2. 生成 summary_embedding（仅用 summary，如果有的话）
+    nodes_with_summary = [node for node in filtered_nodes if node.summary]
+    if nodes_with_summary:
+        summary_texts = [node.summary for node in nodes_with_summary]
+        summary_embeddings = await embedder.create_batch(summary_texts)
+        for node, summary_embedding in zip(nodes_with_summary, summary_embeddings, strict=True):
+            node.summary_embedding = summary_embedding

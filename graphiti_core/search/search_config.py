@@ -27,6 +27,7 @@ from graphiti_core.search.search_utils import (
 )
 
 DEFAULT_SEARCH_LIMIT = 20
+DEFAULT_RERANK_CANDIDATE_LIMIT = 50  # 发送给 reranker 的候选数量
 
 
 class EdgeSearchMethod(Enum):
@@ -116,6 +117,9 @@ class SearchConfig(BaseModel):
     community_config: CommunitySearchConfig | None = Field(default=None)
     limit: int = Field(default=DEFAULT_SEARCH_LIMIT)
     reranker_min_score: float = Field(default=0)
+    # 发送给 cross-encoder reranker 的候选数量（仅在使用 cross_encoder 时生效）
+    # 设为 None 时自动使用 max(limit, DEFAULT_RERANK_CANDIDATE_LIMIT)
+    rerank_candidate_limit: int | None = Field(default=None)
 
 
 class SearchResults(BaseModel):

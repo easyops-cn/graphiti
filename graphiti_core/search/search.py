@@ -27,6 +27,7 @@ from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.search.search_config import (
+    DEFAULT_RERANK_CANDIDATE_LIMIT,
     DEFAULT_SEARCH_LIMIT,
     CommunityReranker,
     CommunitySearchConfig,
@@ -110,6 +111,39 @@ async def search(
 
     # if group_ids is empty, set it to None
     group_ids = group_ids if group_ids and group_ids != [''] else None
+
+    # 计算各组件的检索数量
+    # 如果使用 cross_encoder reranker，需要检索更多候选以便重排序
+    def get_search_limit(component_config, default_limit: int) -> int:
+        """根据 reranker 类型决定检索数量"""
+        if component_config is None:
+            return default_limit
+
+        # 检查是否使用 cross_encoder reranker
+        uses_cross_encoder = False
+        if hasattr(component_config, 'reranker'):
+            reranker = component_config.reranker
+            if reranker in (
+                EdgeReranker.cross_encoder,
+                NodeReranker.cross_encoder,
+                EpisodeReranker.cross_encoder,
+                CommunityReranker.cross_encoder,
+            ):
+                uses_cross_encoder = True
+
+        if uses_cross_encoder:
+            # 使用 rerank_candidate_limit 或默认值
+            candidate_limit = config.rerank_candidate_limit
+            if candidate_limit is None:
+                candidate_limit = max(default_limit, DEFAULT_RERANK_CANDIDATE_LIMIT)
+            return candidate_limit
+        return default_limit
+
+    edge_limit = get_search_limit(config.edge_config, config.limit)
+    node_limit = get_search_limit(config.node_config, config.limit)
+    episode_limit = get_search_limit(config.episode_config, config.limit)
+    community_limit = get_search_limit(config.community_config, config.limit)
+
     (
         (edges, edge_reranker_scores),
         (nodes, node_reranker_scores),
@@ -126,7 +160,7 @@ async def search(
             search_filter,
             center_node_uuid,
             bfs_origin_node_uuids,
-            config.limit,
+            edge_limit,
             config.reranker_min_score,
         ),
         node_search(
@@ -139,7 +173,7 @@ async def search(
             search_filter,
             center_node_uuid,
             bfs_origin_node_uuids,
-            config.limit,
+            node_limit,
             config.reranker_min_score,
         ),
         episode_search(
@@ -150,7 +184,7 @@ async def search(
             group_ids,
             config.episode_config,
             search_filter,
-            config.limit,
+            episode_limit,
             config.reranker_min_score,
         ),
         community_search(
@@ -160,20 +194,21 @@ async def search(
             search_vector,
             group_ids,
             config.community_config,
-            config.limit,
+            community_limit,
             config.reranker_min_score,
         ),
     )
 
+    # 截取到用户请求的 limit
     results = SearchResults(
-        edges=edges,
-        edge_reranker_scores=edge_reranker_scores,
-        nodes=nodes,
-        node_reranker_scores=node_reranker_scores,
-        episodes=episodes,
-        episode_reranker_scores=episode_reranker_scores,
-        communities=communities,
-        community_reranker_scores=community_reranker_scores,
+        edges=edges[: config.limit],
+        edge_reranker_scores=edge_reranker_scores[: config.limit],
+        nodes=nodes[: config.limit],
+        node_reranker_scores=node_reranker_scores[: config.limit],
+        episodes=episodes[: config.limit],
+        episode_reranker_scores=episode_reranker_scores[: config.limit],
+        communities=communities[: config.limit],
+        community_reranker_scores=community_reranker_scores[: config.limit],
     )
 
     latency = (time() - start) * 1000
