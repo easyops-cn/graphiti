@@ -56,7 +56,7 @@ class ExtractedEntity(BaseModel):
     name: str = Field(
         ...,
         description='Name of the extracted entity',
-        validation_alias=AliasChoices('name', 'entity_name'),
+        validation_alias=AliasChoices('name', 'entity_name', 'entity'),
     )
     entity_type_id: int = Field(
         description='ID of the classified entity type. '
@@ -91,7 +91,7 @@ class ExtractedEntityWithScores(BaseModel):
     name: str = Field(
         ...,
         description='Name of the extracted entity',
-        validation_alias=AliasChoices('name', 'entity_name'),
+        validation_alias=AliasChoices('name', 'entity_name', 'entity'),
     )
     top_candidates: list[TopTypeCandidate] = Field(
         ...,
