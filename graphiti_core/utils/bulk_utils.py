@@ -423,6 +423,261 @@ def _redirect_to_db_canonical(
     return redirected_pairs
 
 
+def _select_group_representative(
+    group_uuids: list[str],
+    nodes_by_uuid: dict[str, EntityNode],
+    db_uuids: set[str],
+) -> str:
+    """Select a representative from a group of duplicate nodes.
+
+    Priority: DB node > extracted node (by uuid for determinism)
+    """
+    # Prefer DB nodes
+    db_nodes_in_group = [uuid for uuid in group_uuids if uuid in db_uuids]
+    if db_nodes_in_group:
+        return min(db_nodes_in_group)  # Deterministic selection
+
+    # Otherwise pick the first extracted node (by uuid)
+    return min(group_uuids)
+
+
+def _get_group_representatives(
+    pairs: list[tuple[str, str]],
+    all_uuids: set[str],
+    nodes_by_uuid: dict[str, EntityNode],
+    db_uuids: set[str],
+) -> list[EntityNode]:
+    """Get one representative per group from clustering results.
+
+    Uses union-find to identify groups, then selects one representative per group.
+    DB nodes are preferred as representatives.
+    """
+    # Build groups using union-find
+    parent: dict[str, str] = {uuid: uuid for uuid in all_uuids}
+
+    def find(x: str) -> str:
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a: str, b: str) -> None:
+        pa, pb = find(a), find(b)
+        if pa != pb:
+            parent[pa] = pb
+
+    for src, tgt in pairs:
+        if src in parent and tgt in parent:
+            union(src, tgt)
+
+    # Group nodes by their root
+    groups: dict[str, list[str]] = {}
+    for uuid in all_uuids:
+        root = find(uuid)
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(uuid)
+
+    # Select representative for each group
+    representatives: list[EntityNode] = []
+    for group_uuids in groups.values():
+        rep_uuid = _select_group_representative(group_uuids, nodes_by_uuid, db_uuids)
+        if rep_uuid in nodes_by_uuid:
+            representatives.append(nodes_by_uuid[rep_uuid])
+
+    return representatives
+
+
+async def _recursive_reduce(
+    llm_client: LLMClient,
+    embedder: EmbedderClient,
+    nodes: list[EntityNode],
+    entity_type: str,
+    type_definition: str,
+    batch_size: int,
+    db_uuids: set[str],
+    nodes_by_uuid: dict[str, EntityNode],
+    depth: int = 0,
+) -> list[tuple[str, str]]:
+    """Recursively reduce nodes until batch_size or fewer remain.
+
+    Each reduce round:
+    1. Use embedding clustering to group similar nodes
+    2. Cluster each batch with LLM
+    3. Select one representative per group (DB priority)
+    4. If representatives > batch_size, recurse
+    """
+    if len(nodes) <= 1:
+        return []
+
+    if len(nodes) <= batch_size:
+        # Final clustering - small enough for single LLM call
+        logger.info(
+            '[semantic_dedup] Reduce depth=%d: final clustering %d %s entities',
+            depth, len(nodes), entity_type,
+        )
+        return await _cluster_entities_with_llm(
+            llm_client, nodes, entity_type, type_definition
+        )
+
+    # Use embedding clustering instead of sequential splitting
+    batches = await _cluster_by_embedding(embedder, nodes, batch_size)
+
+    logger.info(
+        '[semantic_dedup] Reduce depth=%d: clustering %d %s entities in %d embedding clusters',
+        depth, len(nodes), entity_type, len(batches),
+    )
+
+    # Cluster each batch in parallel
+    batch_tasks = [
+        _cluster_entities_with_llm(llm_client, batch, entity_type, type_definition)
+        for batch in batches
+    ]
+    batch_results = await semaphore_gather(*batch_tasks)
+
+    # Collect pairs from this round
+    round_pairs: list[tuple[str, str]] = []
+    for pairs in batch_results:
+        round_pairs.extend(pairs)
+
+    # Get representatives for next round
+    current_uuids = {node.uuid for node in nodes}
+    representatives = _get_group_representatives(
+        round_pairs, current_uuids, nodes_by_uuid, db_uuids
+    )
+
+    logger.info(
+        '[semantic_dedup] Reduce depth=%d: %d groups -> %d representatives',
+        depth, len(nodes), len(representatives),
+    )
+
+    # Recurse if still too many representatives
+    if len(representatives) > batch_size:
+        next_round_pairs = await _recursive_reduce(
+            llm_client, embedder, representatives, entity_type, type_definition,
+            batch_size, db_uuids, nodes_by_uuid, depth + 1,
+        )
+        round_pairs.extend(next_round_pairs)
+
+    elif len(representatives) > 1:
+        # Final reduce of representatives
+        final_pairs = await _cluster_entities_with_llm(
+            llm_client, representatives, entity_type, type_definition
+        )
+        round_pairs.extend(final_pairs)
+
+    return round_pairs
+
+
+async def _cluster_by_embedding(
+    embedder: EmbedderClient,
+    nodes: list[EntityNode],
+    max_cluster_size: int,
+) -> list[list[EntityNode]]:
+    """Cluster nodes by embedding similarity using K-means.
+
+    EasyOps optimization: Instead of sequential splitting, group similar entities together.
+    This ensures:
+    - "Hong Kong", "Lung Fu Shan", "Mid-levels" are in DIFFERENT clusters (dissimilar)
+    - "UK" and "United Kingdom" are in the SAME cluster (similar)
+
+    Each cluster is then processed by LLM for fine-grained deduplication.
+
+    Args:
+        embedder: Embedding client
+        nodes: Nodes to cluster
+        max_cluster_size: Maximum nodes per cluster
+
+    Returns:
+        List of node clusters
+    """
+    if len(nodes) <= max_cluster_size:
+        return [nodes]
+
+    # Ensure all nodes have embeddings
+    nodes_without_embedding = [n for n in nodes if n.name_embedding is None]
+    if nodes_without_embedding:
+        texts = [n.name for n in nodes_without_embedding]
+        embeddings = await embedder.create(texts)
+        for node, emb in zip(nodes_without_embedding, embeddings):
+            node.name_embedding = normalize_l2(emb)
+
+    # Build embedding matrix
+    embedding_dim = len(nodes[0].name_embedding)
+    X = np.array([n.name_embedding for n in nodes])
+
+    # Determine number of clusters
+    n_clusters = max(2, (len(nodes) + max_cluster_size - 1) // max_cluster_size)
+
+    # K-means clustering
+    labels = _kmeans_cluster(X, n_clusters, max_iter=20)
+
+    # Group nodes by cluster label
+    clusters: dict[int, list[EntityNode]] = {}
+    for node, label in zip(nodes, labels):
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(node)
+
+    # Handle oversized clusters by splitting
+    result: list[list[EntityNode]] = []
+    for cluster_nodes in clusters.values():
+        if len(cluster_nodes) > max_cluster_size:
+            # Recursively split large clusters
+            sub_clusters = await _cluster_by_embedding(embedder, cluster_nodes, max_cluster_size)
+            result.extend(sub_clusters)
+        else:
+            result.append(cluster_nodes)
+
+    logger.info(
+        '[embedding_cluster] Grouped %d nodes into %d clusters (target size: %d)',
+        len(nodes), len(result), max_cluster_size,
+    )
+
+    return result
+
+
+def _kmeans_cluster(X: np.ndarray, n_clusters: int, max_iter: int = 20) -> list[int]:
+    """Simple K-means clustering implementation.
+
+    Avoids sklearn dependency. Uses K-means++ initialization.
+    """
+    n_samples = X.shape[0]
+
+    if n_clusters >= n_samples:
+        return list(range(n_samples))
+
+    # K-means++ initialization
+    centers = [X[np.random.randint(n_samples)]]
+    for _ in range(1, n_clusters):
+        # Compute distances to nearest center
+        dists = np.min([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0)
+        # Sample proportional to distance squared
+        probs = dists / dists.sum()
+        idx = np.random.choice(n_samples, p=probs)
+        centers.append(X[idx])
+    centers = np.array(centers)
+
+    # K-means iterations
+    labels = np.zeros(n_samples, dtype=int)
+    for _ in range(max_iter):
+        # Assign to nearest center
+        dists = np.array([np.sum((X - c) ** 2, axis=1) for c in centers])
+        new_labels = np.argmin(dists, axis=0)
+
+        # Check convergence
+        if np.array_equal(labels, new_labels):
+            break
+        labels = new_labels
+
+        # Update centers
+        for k in range(n_clusters):
+            mask = labels == k
+            if mask.any():
+                centers[k] = X[mask].mean(axis=0)
+
+    return labels.tolist()
+
+
 async def _cluster_entity_type_with_batching(
     clients: GraphitiClients,
     type_nodes: list[EntityNode],
@@ -430,7 +685,7 @@ async def _cluster_entity_type_with_batching(
     type_definition: str,
     batch_size: int,
 ) -> list[tuple[str, str]]:
-    """Cluster nodes of a single entity type, with batching and reduce for large sets.
+    """Cluster nodes of a single entity type, with batching and recursive reduce.
 
     EasyOps: Now includes DB candidate search for cross-request deduplication.
 
@@ -441,7 +696,7 @@ async def _cluster_entity_type_with_batching(
     4. Return pairs where source is an extracted node (DB nodes are only targets)
 
     Map phase: Split into batches, cluster each batch
-    Reduce phase: Cluster the canonical nodes from all batches
+    Reduce phase: Recursively cluster representatives until batch_size or fewer
     """
     extracted_uuids = {node.uuid for node in type_nodes}
 
@@ -453,6 +708,8 @@ async def _cluster_entity_type_with_batching(
 
     # Combine extracted nodes with DB candidates
     all_nodes = type_nodes + db_candidates
+    nodes_by_uuid = {node.uuid: node for node in all_nodes}
+
     logger.info(
         '[semantic_dedup] Clustering %s: %d extracted + %d DB candidates = %d total',
         entity_type, len(type_nodes), len(db_candidates), len(all_nodes),
@@ -475,17 +732,16 @@ async def _cluster_entity_type_with_batching(
         # Filter: only return pairs where source is an extracted node
         return [(src, tgt) for src, tgt in all_pairs if src in extracted_uuids]
 
-    # Map phase: split into batches and cluster each
-    # Note: We include DB candidates in the first batch to ensure they're considered
-    logger.info(
-        '[semantic_dedup] Clustering %d %s entities in %d batches',
-        len(all_nodes), entity_type, (len(all_nodes) + batch_size - 1) // batch_size,
-    )
+    # Map phase: use embedding clustering instead of sequential splitting
+    # This groups similar entities together, so:
+    # - "Hong Kong", "Mid-levels", "Lung Fu Shan" go to DIFFERENT clusters (dissimilar)
+    # - "UK" and "United Kingdom" go to the SAME cluster (similar)
+    batches = await _cluster_by_embedding(clients.embedder, all_nodes, batch_size)
 
-    batches = [
-        all_nodes[i:i + batch_size]
-        for i in range(0, len(all_nodes), batch_size)
-    ]
+    logger.info(
+        '[semantic_dedup] Map phase: %d %s entities in %d embedding clusters',
+        len(all_nodes), entity_type, len(batches),
+    )
 
     # Cluster each batch in parallel
     batch_tasks = [
@@ -496,27 +752,31 @@ async def _cluster_entity_type_with_batching(
 
     # Collect all duplicate pairs from map phase
     all_pairs: list[tuple[str, str]] = []
-    nodes_by_uuid = {node.uuid: node for node in all_nodes}
-
     for pairs in batch_results:
         all_pairs.extend(pairs)
 
-    # Canonical nodes are: all nodes minus those that are source in pairs
-    all_duplicate_sources = {p[0] for p in all_pairs}
-    canonical_nodes = [
-        nodes_by_uuid[uuid]
-        for uuid in nodes_by_uuid
-        if uuid not in all_duplicate_sources
-    ]
+    # Get representatives for reduce phase (one per group, DB priority)
+    all_uuids = {node.uuid for node in all_nodes}
+    representatives = _get_group_representatives(
+        all_pairs, all_uuids, nodes_by_uuid, db_uuids
+    )
 
-    # Reduce phase: if we have multiple batches and >1 canonical node, cluster them
-    if len(batches) > 1 and len(canonical_nodes) > 1:
+    logger.info(
+        '[semantic_dedup] Map phase complete: %d entities -> %d representatives',
+        len(all_nodes), len(representatives),
+    )
+
+    # Reduce phase: single LLM call for all representatives
+    # Since embedding clustering already grouped similar entities in Map phase,
+    # representatives from different clusters are likely different entities.
+    # We just need one final LLM call to catch any cross-cluster duplicates.
+    if len(representatives) > 1:
         logger.info(
-            '[semantic_dedup] Reduce phase: clustering %d canonical %s entities',
-            len(canonical_nodes), entity_type,
+            '[semantic_dedup] Reduce phase: clustering %d representatives',
+            len(representatives),
         )
         reduce_pairs = await _cluster_entities_with_llm(
-            clients.llm_client, canonical_nodes, entity_type, type_definition
+            clients.llm_client, representatives, entity_type, type_definition
         )
         all_pairs.extend(reduce_pairs)
 
@@ -747,6 +1007,7 @@ async def add_nodes_and_edges_bulk_tx(
             'summary': summary,
             'created_at': node.created_at,
             'name_embedding': node.name_embedding,
+            'summary_embedding': node.summary_embedding,  # EasyOps: 双向量策略
             'labels': list(set(node.labels + ['Entity'])),
             'reasoning': reasoning,
             # EasyOps: Save type classification scores (same as nodes.py save())
@@ -821,6 +1082,37 @@ async def add_nodes_and_edges_bulk_tx(
         episodic_edge_query = get_episodic_edge_save_bulk_query(driver.provider)
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
+    elif driver.provider == GraphProvider.FALKORDB:
+        # FalkorDB: get_entity_node_save_bulk_query returns a list of (query, params) tuples
+        # because FalkorDB needs to set labels one by one
+        episode_query = get_episode_node_save_bulk_query(driver.provider)
+        logger.info(f'[bulk_save] Saving {len(episodes)} episodes')
+        await tx.run(episode_query, episodes=episodes)
+
+        # Entity nodes - iterate over query tuples
+        entity_node_queries = get_entity_node_save_bulk_query(driver.provider, nodes)
+        logger.info(f'[bulk_save] Saving {len(nodes)} entity nodes ({len(entity_node_queries)} queries)')
+        for query, params in entity_node_queries:
+            await tx.run(query, **params)
+
+        # Episodic edges
+        await tx.run(
+            get_episodic_edge_save_bulk_query(driver.provider),
+            episodic_edges=[edge.model_dump() for edge in episodic_edges],
+        )
+
+        # Entity edges by type
+        edges_by_type: dict[str, list[dict[str, Any]]] = {}
+        for edge in edges:
+            edge_type = edge.get('name', 'RELATES_TO')
+            if edge_type not in edges_by_type:
+                edges_by_type[edge_type] = []
+            edges_by_type[edge_type].append(edge)
+
+        for edge_type, typed_edges in edges_by_type.items():
+            query = get_entity_edge_save_bulk_query_by_type(driver.provider, edge_type)
+            logger.info(f'[bulk_save] Saving {len(typed_edges)} edges of type {edge_type}')
+            await tx.run(query, entity_edges=typed_edges)
     else:
         # Log bulk save operation details for debugging
         episode_query = get_episode_node_save_bulk_query(driver.provider)
@@ -828,6 +1120,7 @@ async def add_nodes_and_edges_bulk_tx(
         if not episode_query or not episode_query.strip():
             logger.error(f'[bulk_save] Empty episode query! provider={driver.provider}, episodes_count={len(episodes)}')
         await tx.run(episode_query, episodes=episodes)
+        logger.info(f'[bulk_save] Saving {len(nodes)} entity nodes')
         await tx.run(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,

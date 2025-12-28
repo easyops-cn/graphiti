@@ -423,15 +423,23 @@ async def node_search(
             reranker_min_score,
         )
     elif config.reranker == NodeReranker.cross_encoder:
-        name_to_uuid_map = {node.name: node.uuid for node in list(node_uuid_map.values())}
+        # EasyOps: 使用 name + summary 进行 cross_encoder reranking
+        # 只用 name 会导致 reranker 无法判断相关性（例如问 "who is the father of X"，只有 summary 包含答案）
+        text_to_uuid_map = {}
+        for node in node_uuid_map.values():
+            if node.summary:
+                text = f"{node.name}: {node.summary}"
+            else:
+                text = node.name
+            text_to_uuid_map[text] = node.uuid
 
-        reranked_node_names = await cross_encoder.rank(query, list(name_to_uuid_map.keys()))
+        reranked_texts = await cross_encoder.rank(query, list(text_to_uuid_map.keys()))
         reranked_uuids = [
-            name_to_uuid_map[name]
-            for name, score in reranked_node_names
+            text_to_uuid_map[text]
+            for text, score in reranked_texts
             if score >= reranker_min_score
         ]
-        node_scores = [score for _, score in reranked_node_names if score >= reranker_min_score]
+        node_scores = [score for _, score in reranked_texts if score >= reranker_min_score]
     elif config.reranker == NodeReranker.episode_mentions:
         reranked_uuids, node_scores = await episode_mentions_reranker(
             driver, search_result_uuids, min_score=reranker_min_score

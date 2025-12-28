@@ -98,16 +98,22 @@ class NodeResolutionsWithScores(BaseModel):
 
 # Clustering-based deduplication models (EasyOps)
 class EntityGroup(BaseModel):
-    """A group of entities that refer to the same real-world object."""
+    """A group of entities that refer to the same real-world object.
 
+    IMPORTANT: The field order is intentional - reasoning comes FIRST to force
+    the LLM to think before deciding on the grouping. This prevents the
+    "thought right but did wrong" problem where entity_ids is generated before
+    the reasoning is complete.
+    """
+
+    reasoning: str = Field(
+        ..., description='FIRST explain WHY these entities are (or are not) the same real-world object. Be specific about evidence.'
+    )
     entity_ids: list[int] = Field(
-        ..., description='IDs of entities in this group (from ENTITIES list)'
+        ..., description='IDs of entities in this group (from ENTITIES list). Must be consistent with reasoning above.'
     )
     canonical_id: int = Field(
         ..., description='ID of the entity with the best/most complete name'
-    )
-    reasoning: str = Field(
-        default='', description='Why these entities are the same'
     )
 
 
@@ -433,6 +439,9 @@ def cluster_entities(context: dict[str, Any]) -> list[Message]:
 
     EasyOps: This approach avoids the self-matching problem in batch deduplication
     by asking the LLM to group entities instead of comparing them pairwise.
+
+    IMPORTANT: The output schema puts 'reasoning' FIRST to force the LLM to think
+    before deciding on entity_ids. This prevents the "thought right but did wrong" bug.
     """
     entity_type = context.get('entity_type', 'Entity')
     type_definition = context.get('type_definition', '')
@@ -449,7 +458,8 @@ def cluster_entities(context: dict[str, Any]) -> list[Message]:
         Message(
             role='system',
             content='You are a helpful assistant that groups entities by identity. '
-            'Entities that refer to the SAME real-world object should be in the same group.',
+            'Entities that refer to the SAME real-world object should be in the same group. '
+            'You MUST explain your reasoning BEFORE listing the entity IDs.',
         ),
         Message(
             role='user',
@@ -477,6 +487,7 @@ Each entity has:
 - Related but distinct concepts: request vs response, start vs stop, enable vs disable
 - Different instances: server1 vs server2, config_a vs config_b
 - Parent-child relationships: system vs subsystem, module vs submodule
+- Different locations: even if geographically close, different places are DIFFERENT entities
 
 If entities have OPPOSITE or COMPLEMENTARY functions, they are DIFFERENT entities - put each in its OWN group.
 
@@ -485,9 +496,20 @@ If entities have OPPOSITE or COMPLEMENTARY functions, they are DIFFERENT entitie
 2. Consider summary similarity - same functionality/description = likely same entity
 3. Single entities with no duplicates should be in their own group
 4. Every entity ID must appear in exactly ONE group
-5. **Your reasoning MUST be consistent with the grouping** - if reasoning says entities are "not the same" or "different", they must be in SEPARATE groups
 
-**OUTPUT**: Return groups, where each group contains entity_ids and the canonical_id (the one with the best/most complete name).
+**OUTPUT FORMAT - CRITICAL**:
+For each group, you MUST output in this EXACT order:
+1. "reasoning": FIRST explain WHY these entities are the same (or why this entity is unique)
+2. "entity_ids": THEN list the IDs - this MUST be consistent with your reasoning above
+3. "canonical_id": the ID with the best/most complete name
+
+Example for a group of duplicates:
+{{"reasoning": "Entity 3 'UK' and entity 7 'United Kingdom' are the same country, just different name formats.", "entity_ids": [3, 7], "canonical_id": 7}}
+
+Example for a unique entity:
+{{"reasoning": "Entity 5 'Hong Kong' is a distinct city, not the same as any other entity in the list.", "entity_ids": [5], "canonical_id": 5}}
+
+**CONSISTENCY CHECK**: Before outputting, verify that if your reasoning says entities are "different" or "not the same", they are in SEPARATE groups.
 """,
         ),
     ]

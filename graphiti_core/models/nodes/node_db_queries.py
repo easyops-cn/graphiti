@@ -201,15 +201,27 @@ def get_entity_node_save_bulk_query(
             queries = []
             for node in nodes:
                 for label in node['labels']:
+                    # EasyOps fix: Set properties individually to avoid List type for embeddings
+                    # Using SET n = node would set embeddings as List, then vecf32() would fail
+                    # because FalkorDB doesn't allow overwriting List with Vectorf32
                     queries.append(
                         (
                             f"""
                             UNWIND $nodes AS node
                             MERGE (n:Entity {{uuid: node.uuid}})
                             SET n:{label}
-                            SET n = node
+                            SET n.uuid = node.uuid,
+                                n.name = node.name,
+                                n.group_id = node.group_id,
+                                n.summary = node.summary,
+                                n.created_at = node.created_at,
+                                n.labels = node.labels,
+                                n.reasoning = node.reasoning,
+                                n.type_scores = node.type_scores,
+                                n.type_confidence = node.type_confidence
                             WITH n, node
                             SET n.name_embedding = vecf32(node.name_embedding)
+                            SET n.summary_embedding = CASE WHEN node.summary_embedding IS NOT NULL THEN vecf32(node.summary_embedding) ELSE NULL END
                             RETURN n.uuid AS uuid
                             """,
                             {'nodes': [node]},

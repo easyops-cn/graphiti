@@ -13,6 +13,7 @@
 | `graphiti_core/utils/bulk_utils.py` | **架构重构** | **聚类去重：避免自匹配问题 + 按类型分组 + Map-Reduce** |
 | `graphiti_core/prompts/dedupe_nodes.py` | **新增** | **EntityClustering 模型 + cluster_entities 提示词** |
 | `graphiti_core/graphiti.py` | **性能优化** | **移除 resolve_extracted_nodes 调用，改用 semantic_dedupe_nodes_bulk** |
+| `graphiti_core/search/search.py` | **Bug修复** | **Cross-encoder reranking 使用 name+summary 而非仅 name** |
 | `graphiti_core/graphiti.py` | **性能优化** | **移除全局 DB 候选收集，由 Map 阶段按批处理** |
 | `graphiti_core/utils/maintenance/edge_operations.py` | 逻辑修改 | 严格控制边类型，非 Schema 类型降级 |
 | `graphiti_core/prompts/extract_nodes.py` | 新增 | Knowledge Graph Builder's Principles + filter_entities |
@@ -59,6 +60,9 @@
 | `graphiti_core/utils/maintenance/node_operations.py` | **性能优化** | **_extract_entity_summaries_bulk 批量提取 + extract_attributes_from_nodes 改用批量** |
 | `scripts/cleanup_duplicate_nodes.py` | **新增脚本** | **离线清理重复节点：用 LLM 识别并合并数据库中的历史重复数据** |
 | `graphiti_core/prompts/dedupe_nodes.py` | **Prompt增强** | **cluster_entities() 防止相反操作被错误分组（backup vs restore）** |
+| `graphiti_core/search/search_utils.py` | **Bug修复** | **BFS 遍历所有边类型，而非仅 RELATES_TO\|MENTIONS** |
+| `graphiti_core/search/search_config_recipes.py` | **功能增强** | **COMBINED_HYBRID_SEARCH_RRF 启用 BFS（无需 reranker 也能多跳检索）** |
+| `graphiti_core/models/nodes/node_db_queries.py` | **Bug修复** | **FalkorDB 批量保存: 避免 SET n = node 导致 embedding 存储为 List** |
 
 ---
 
@@ -3393,3 +3397,504 @@ poetry run python scripts/update_all_embeddings.py <group_id> --verify <entity_n
 1. **数据迁移**：升级后需运行批量更新脚本为所有实体生成 `summary_embedding`
 2. **存储增加**：每个有 summary 的实体会额外存储一个向量（约 3KB/实体，1536 维）
 3. **查询兼容**：`summary_embedding` 为 NULL 时自动降级为仅使用 `name_embedding`
+
+---
+
+## 30. BFS 遍历所有边类型（BFS Traverse All Edge Types）
+
+### 问题背景
+
+EasyOps 在第 2 章节"动态边类型支持"中修改了边的保存逻辑，使 LLM 抽取的边类型（如 `CREATED`、`DIRECTED`、`MANAGES`）能正确保存到数据库，而非统一使用 `RELATES_TO`。
+
+但 BFS 搜索代码没有相应更新，仍然硬编码遍历 `[:RELATES_TO|MENTIONS]`：
+
+```cypher
+-- 修改前（只遍历这两种边类型）
+MATCH path = (origin {uuid: origin_uuid})-[:RELATES_TO|MENTIONS*1..{depth}]->(:Entity)
+MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]-(m:Entity)
+```
+
+这导致通过其他边类型连接的实体无法被 BFS 发现。
+
+**具体案例**：
+
+问题："Who wrote Tom Vaughan's 2008 film?"
+期望答案："Dana Fox"
+
+图中存在的边：
+```
+Tom Vaughan --[CREATED]--> What Happens in Vegas
+Dana Fox --[CREATED]--> What Happens in Vegas
+```
+
+但因为 BFS 只遍历 `RELATES_TO|MENTIONS`，从 `Tom Vaughan` 出发无法发现 `What Happens in Vegas` 节点，进而无法通过关系推理找到 `Dana Fox`。
+
+### 解决方案
+
+修改 BFS 查询，遍历所有边类型：
+
+```cypher
+-- 修改后（遍历任意边类型）
+MATCH path = (origin {uuid: origin_uuid})-[*1..{depth}]->(:Entity)
+MATCH (n:Entity)-[e {uuid: rel.uuid}]-(m:Entity)
+```
+
+**文件**: `graphiti_core/search/search_utils.py`
+
+**Neptune 分支**（第 501、504 行）：
+
+```python
+# 修改前
+MATCH path = (origin {uuid: origin_uuid})-[:RELATES_TO|MENTIONS *1..{bfs_max_depth}]->(n:Entity)
+MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]-(m:Entity)
+
+# 修改后
+MATCH path = (origin {uuid: origin_uuid})-[*1..{bfs_max_depth}]->(n:Entity)
+MATCH (n:Entity)-[e {uuid: rel.uuid}]-(m:Entity)
+```
+
+**FalkorDB/Neo4j 分支**（第 528、530 行）：
+
+```python
+# 修改前
+MATCH path = (origin {uuid: origin_uuid})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(:Entity)
+MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]-(m:Entity)
+
+# 修改后
+MATCH path = (origin {uuid: origin_uuid})-[*1..{bfs_max_depth}]->(:Entity)
+MATCH (n:Entity)-[e {uuid: rel.uuid}]-(m:Entity)
+```
+
+### 效果
+
+| 场景 | 修复前 | 修复后 |
+|-----|-------|-------|
+| 通过 CREATED 边连接的实体 | ❌ 无法发现 | ✅ 正常遍历 |
+| 通过 DIRECTED 边连接的实体 | ❌ 无法发现 | ✅ 正常遍历 |
+| 通过 MANAGES 边连接的实体 | ❌ 无法发现 | ✅ 正常遍历 |
+| 多跳推理（如 Person → Movie → Writer） | ❌ 中断 | ✅ 完整路径 |
+
+### 注意事项
+
+1. **Kuzu 分支未修改**：Kuzu 使用特殊的中间节点存储边（`RelatesToNode_`），其 `RELATES_TO` 是遍历边而非业务边类型，保持原有逻辑
+2. **性能影响**：遍历所有边类型可能略微增加查询范围，但由于有 `depth` 限制和结果去重，影响可控
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/search/search_utils.py` | Neptune 分支 BFS 查询改为遍历所有边类型 |
+| `graphiti_core/search/search_utils.py` | FalkorDB/Neo4j 分支 BFS 查询改为遍历所有边类型 |
+
+---
+
+## 31. RRF 搜索配置启用 BFS（Enable BFS in RRF Search Config）
+
+### 问题背景
+
+Graphiti 提供多种预定义的搜索配置（Search Config Recipes），决定搜索时使用哪些检索方法：
+
+| 配置 | 边检索方法 | 节点检索方法 |
+|-----|-----------|-------------|
+| `COMBINED_HYBRID_SEARCH_RRF` | BM25, Cosine | BM25, Cosine |
+| `COMBINED_HYBRID_SEARCH_CROSS_ENCODER` | BM25, Cosine, **BFS** | BM25, Cosine, **BFS** |
+
+Elevo Memory 的搜索逻辑：
+
+```python
+# search.py
+if settings.qwen_reranker_enabled:
+    base_config = COMBINED_HYBRID_SEARCH_CROSS_ENCODER  # 包含 BFS
+elif settings.search_enable_llm_reranker:
+    base_config = COMBINED_HYBRID_SEARCH_CROSS_ENCODER  # 包含 BFS
+else:
+    base_config = COMBINED_HYBRID_SEARCH_RRF  # 不包含 BFS！
+```
+
+**问题**：当 reranker 未启用时（默认配置），使用 `COMBINED_HYBRID_SEARCH_RRF`，该配置**不包含 BFS**，导致无法通过图遍历发现关联实体。
+
+第 30 章节修复了 BFS 的边类型限制问题，但如果搜索配置根本不调用 BFS，修复就无法生效。
+
+### 解决方案
+
+在 `COMBINED_HYBRID_SEARCH_RRF` 中添加 BFS 搜索方法：
+
+**文件**: `graphiti_core/search/search_config_recipes.py`
+
+```python
+# 修改前
+COMBINED_HYBRID_SEARCH_RRF = SearchConfig(
+    edge_config=EdgeSearchConfig(
+        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+        reranker=EdgeReranker.rrf,
+    ),
+    node_config=NodeSearchConfig(
+        search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity],
+        reranker=NodeReranker.rrf,
+    ),
+    # ...
+)
+
+# 修改后
+COMBINED_HYBRID_SEARCH_RRF = SearchConfig(
+    edge_config=EdgeSearchConfig(
+        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity, EdgeSearchMethod.bfs],
+        reranker=EdgeReranker.rrf,
+    ),
+    node_config=NodeSearchConfig(
+        search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity, NodeSearchMethod.bfs],
+        reranker=NodeReranker.rrf,
+    ),
+    # ...
+)
+```
+
+### 效果
+
+| 场景 | 修复前 | 修复后 |
+|-----|-------|-------|
+| 无 reranker 时的多跳检索 | ❌ 不触发 BFS | ✅ 正常 BFS 遍历 |
+| 边向量 → 边 BFS 关联 | ❌ 仅向量检索 | ✅ 向量 + BFS |
+| 节点向量 → 节点 BFS 关联 | ❌ 仅向量检索 | ✅ 向量 + BFS |
+
+### 与第 30 章节的关系
+
+- **第 30 章节**：修复 BFS 的边类型限制（从 `RELATES_TO|MENTIONS` 改为遍历所有边类型）
+- **第 31 章节**：确保 BFS 被调用（在 RRF 配置中启用 BFS）
+
+两个修复缺一不可：
+1. 如果只有第 30 章节，但 RRF 配置不调用 BFS，修复无效
+2. 如果只有第 31 章节，但 BFS 只遍历 `RELATES_TO|MENTIONS`，动态边类型仍无法发现
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/search/search_config_recipes.py` | `COMBINED_HYBRID_SEARCH_RRF` 的 edge_config 和 node_config 添加 BFS |
+
+---
+
+## 32. 批量保存补充 summary_embedding 字段（Bulk Save Summary Embedding Fix）
+
+### 问题背景
+
+第 29 章节实现了"双向量 Max Score 策略"，EntityNode 新增了 `summary_embedding` 字段，用于分别存储 name 和 summary 的向量。
+
+但在批量保存时（`add_nodes_and_edges_bulk_tx`），entity_data 字典只包含了 `name_embedding`，**遗漏了 `summary_embedding`**：
+
+```python
+# bulk_utils.py 第 1003-1015 行（修改前）
+entity_data: dict[str, Any] = {
+    'uuid': node.uuid,
+    'name': name,
+    'group_id': node.group_id,
+    'summary': summary,
+    'created_at': node.created_at,
+    'name_embedding': node.name_embedding,
+    # 缺失: 'summary_embedding': node.summary_embedding,
+    'labels': list(set(node.labels + ['Entity'])),
+    ...
+}
+```
+
+**影响**：
+- 所有通过 `add_episode_bulk` 批量导入的实体，`summary_embedding` 都是 NULL
+- 双向量策略无法生效，搜索时只能使用 `name_embedding`
+- 中文 summary 的语义无法被正确检索
+
+**具体案例**：
+- 查询 "What is the name of the father of Childericus?"
+- 期望结果：Merovech（summary 包含 "father of Childeric I"）
+- 实际结果：Merovech 排名第 40 位（只用 name_score=0.48，summary_score=0.0 因为向量为空）
+
+### 解决方案
+
+**文件**: `graphiti_core/utils/bulk_utils.py`
+
+在 `add_nodes_and_edges_bulk_tx` 函数中的 entity_data 字典添加 `summary_embedding` 字段：
+
+```python
+entity_data: dict[str, Any] = {
+    'uuid': node.uuid,
+    'name': name,
+    'group_id': node.group_id,
+    'summary': summary,
+    'created_at': node.created_at,
+    'name_embedding': node.name_embedding,
+    'summary_embedding': node.summary_embedding,  # EasyOps: 双向量策略
+    'labels': list(set(node.labels + ['Entity'])),
+    'reasoning': reasoning,
+    # ...
+}
+```
+
+### 对比 nodes.py 的 save() 方法
+
+单个节点保存时（`nodes.py:536`）正确包含了 `summary_embedding`：
+
+```python
+entity_data: dict[str, Any] = {
+    'uuid': self.uuid,
+    'name': self.name,
+    'name_embedding': self.name_embedding,
+    'summary_embedding': self.summary_embedding,  # 正确包含
+    # ...
+}
+```
+
+批量保存应与单个保存保持一致。
+
+### 效果
+
+修复后，批量导入的实体会正确保存 `summary_embedding`，搜索时可以使用 max(name_score, summary_score) 策略。
+
+| 指标 | 修复前 | 修复后 |
+|-----|-------|-------|
+| summary_embedding | NULL | 正确向量 |
+| 中文 summary 语义检索 | ❌ 无效 | ✅ 正常 |
+| Merovech 搜索排名 | 第 40 位 | 预期 Top 10 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/utils/bulk_utils.py` | `entity_data` 字典添加 `summary_embedding` 字段 |
+
+### 升级注意事项
+
+已导入的数据需要重新导入或运行批量更新脚本来生成 `summary_embedding`：
+
+```bash
+# 方法 1: 重新导入数据
+# 清空 group_id 后重新运行导入
+
+# 方法 2: 运行更新脚本
+poetry run python scripts/update_all_embeddings.py <group_id>
+```
+
+---
+
+## 33. FalkorDB 批量保存避免 embedding 存储为 List（Batch Save Vectorf32 Fix）
+
+### 问题背景
+
+FalkorDB 批量保存实体节点时，`summary_embedding` 被存储为 Python List 类型而非 FalkorDB 原生的 Vectorf32 类型，导致向量搜索时报错：
+
+```
+Type mismatch: expected Null or Vectorf32 but was List
+```
+
+**具体现象**：
+- `name_embedding` 向量自相似度查询正常（返回 0.0）
+- `summary_embedding` 向量自相似度查询失败（类型不匹配）
+
+```cypher
+-- 正常（name_embedding 是 Vectorf32）
+MATCH (n:Entity) RETURN vec.cosineDistance(n.name_embedding, n.name_embedding) LIMIT 1
+-- 返回: 0.0
+
+-- 失败（summary_embedding 是 List）
+MATCH (n:Entity) RETURN vec.cosineDistance(n.summary_embedding, n.summary_embedding) LIMIT 1
+-- 错误: Type mismatch: expected Null or Vectorf32 but was List
+```
+
+### 根因分析
+
+**文件**: `graphiti_core/models/nodes/node_db_queries.py`
+
+原有的 FalkorDB 批量保存查询使用 `SET n = node` 一次性设置所有属性：
+
+```cypher
+UNWIND $nodes AS node
+MERGE (n:Entity {uuid: node.uuid})
+SET n:{label}
+SET n = node                    -- 问题根源：这会把 embedding 设置为 List
+WITH n, node
+SET n.name_embedding = vecf32(node.name_embedding)
+SET n.summary_embedding = CASE WHEN node.summary_embedding IS NOT NULL
+                               THEN vecf32(node.summary_embedding) ELSE NULL END
+RETURN n.uuid AS uuid
+```
+
+**问题**：
+1. `SET n = node` 会设置 node 字典中的**所有**属性，包括 `name_embedding` 和 `summary_embedding`
+2. 此时 embedding 被设置为 Python List 类型
+3. 后续的 `SET n.name_embedding = vecf32(...)` 对于 `name_embedding` 能正常覆盖
+4. 但 `summary_embedding` 虽然也尝试用 `vecf32()` 覆盖，FalkorDB 不允许将 List 类型属性覆盖为 Vectorf32 类型
+
+**关键发现**：`name_embedding` 能正常工作是因为它在 `SET n = node` 之前就存在于 Cypher 查询参数中，而 FalkorDB 对已存在的 Vectorf32 属性可以重新赋值。但对于新设置的 List 属性，无法直接转换为 Vectorf32。
+
+### 解决方案
+
+**修改策略**：不使用 `SET n = node`，而是显式设置每个属性，确保 embedding 只通过 `vecf32()` 函数设置。
+
+**修改前**：
+```python
+case GraphProvider.FALKORDB:
+    queries = []
+    for node in nodes:
+        for label in node['labels']:
+            queries.append(
+                (
+                    f"""
+                    UNWIND $nodes AS node
+                    MERGE (n:Entity {{uuid: node.uuid}})
+                    SET n:{label}
+                    SET n = node
+                    WITH n, node
+                    SET n.name_embedding = vecf32(node.name_embedding)
+                    SET n.summary_embedding = CASE WHEN node.summary_embedding IS NOT NULL THEN vecf32(node.summary_embedding) ELSE NULL END
+                    RETURN n.uuid AS uuid
+                    """,
+                    {'nodes': [node]},
+                )
+            )
+    return queries
+```
+
+**修改后**：
+```python
+case GraphProvider.FALKORDB:
+    queries = []
+    for node in nodes:
+        for label in node['labels']:
+            # EasyOps fix: Set properties individually to avoid List type for embeddings
+            # Using SET n = node would set embeddings as List, then vecf32() would fail
+            # because FalkorDB doesn't allow overwriting List with Vectorf32
+            queries.append(
+                (
+                    f"""
+                    UNWIND $nodes AS node
+                    MERGE (n:Entity {{uuid: node.uuid}})
+                    SET n:{label}
+                    SET n.uuid = node.uuid,
+                        n.name = node.name,
+                        n.group_id = node.group_id,
+                        n.summary = node.summary,
+                        n.created_at = node.created_at,
+                        n.labels = node.labels,
+                        n.reasoning = node.reasoning,
+                        n.type_scores = node.type_scores,
+                        n.type_confidence = node.type_confidence
+                    WITH n, node
+                    SET n.name_embedding = vecf32(node.name_embedding)
+                    SET n.summary_embedding = CASE WHEN node.summary_embedding IS NOT NULL THEN vecf32(node.summary_embedding) ELSE NULL END
+                    RETURN n.uuid AS uuid
+                    """,
+                    {'nodes': [node]},
+                )
+            )
+    return queries
+```
+
+### 效果
+
+修复后，`summary_embedding` 正确存储为 Vectorf32 类型，双向量搜索策略正常工作：
+
+| 指标 | 修复前 | 修复后 |
+|-----|-------|-------|
+| `summary_embedding` 类型 | List（错误） | Vectorf32（正确） |
+| 向量自相似度查询 | 类型不匹配错误 | 正常返回 0.0 |
+| 双向量 Max Score 搜索 | 失败 | 正常工作 |
+| Merovech 搜索排名（父亲问题） | N/A（搜索失败） | Top 10 |
+
+### 验证方法
+
+```cypher
+-- 验证 summary_embedding 类型正确
+MATCH (n:Entity)
+WHERE n.summary_embedding IS NOT NULL
+RETURN n.name, vec.cosineDistance(n.summary_embedding, n.summary_embedding) AS self_sim
+LIMIT 5
+
+-- 预期结果：self_sim 全部为 0.0（完全相似）
+```
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/models/nodes/node_db_queries.py` | FalkorDB 分支改为显式设置属性，避免 `SET n = node` |
+
+### 升级注意事项
+
+已导入的数据如果存在 `summary_embedding` 为 List 类型的问题，需要：
+
+1. **删除旧图并重新导入**（推荐）：
+   ```bash
+   # 删除图
+   curl -X DELETE http://localhost:8000/api/v1/graphs/{group_id}
+
+   # 重新导入
+   curl -X POST http://localhost:8000/api/v1/episodes/bulk -d @data.json
+   ```
+
+2. **或运行批量更新脚本**：
+   ```bash
+   poetry run python scripts/update_all_embeddings.py <group_id>
+   ```
+
+---
+
+## Cross-encoder Reranking 使用 name+summary（搜索质量修复）
+
+### 问题背景
+
+使用 Cross-encoder（如 Qwen Reranker）进行实体重排序时，原版 Graphiti 只使用 `node.name` 作为 passage 传给 cross_encoder.rank()。这导致 reranker 无法准确判断实体与查询的相关性。
+
+**案例分析**：
+
+对于查询 "What is the name of the father of Childericus?"：
+
+| 实体名称 | 只用 name 的得分 | 用 name+summary 的得分 |
+|---------|-----------------|----------------------|
+| Childeric I | 0.06（排第9） | **0.95**（排第1） |
+| Saints Maximus and Domitius | 0.45（排第1） | 0.22（排第4） |
+
+只用 name 时，"Childeric I" 这个名字与问题中的 "father of Childericus" 看起来不相关（因为问的是父亲是谁，而不是 Childeric 本身）。但 summary 包含关键信息："son of Merovech"（Merovech 是正确答案）。
+
+### 解决方案
+
+**文件**: `graphiti_core/search/search.py`
+
+修改 `node_search()` 函数中的 cross_encoder 处理逻辑：
+
+```python
+elif config.reranker == NodeReranker.cross_encoder:
+    # EasyOps: 使用 name + summary 进行 cross_encoder reranking
+    # 只用 name 会导致 reranker 无法判断相关性（例如问 "who is the father of X"，只有 summary 包含答案）
+    text_to_uuid_map = {}
+    for node in node_uuid_map.values():
+        if node.summary:
+            text = f"{node.name}: {node.summary}"
+        else:
+            text = node.name
+        text_to_uuid_map[text] = node.uuid
+
+    reranked_texts = await cross_encoder.rank(query, list(text_to_uuid_map.keys()))
+    reranked_uuids = [
+        text_to_uuid_map[text]
+        for text, score in reranked_texts
+        if score >= reranker_min_score
+    ]
+    node_scores = [score for _, score in reranked_texts if score >= reranker_min_score]
+```
+
+### 效果
+
+修复后，使用 HotPotQA 数据集测试：
+
+| 问题 | 修复前排名 | 修复后排名 |
+|-----|-----------|-----------|
+| Childeric I (父亲问题) | 第9 | **第1** |
+| 其他多跳推理问题 | 经常丢失 | 正确排序 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|-----|---------|
+| `graphiti_core/search/search.py` | Cross-encoder 使用 `name: summary` 格式作为 passage |
+
+### 升级注意事项
+
+此修改不影响已存储的数据，只影响搜索时的重排序逻辑。升级后无需重新导入数据。

@@ -365,6 +365,9 @@ class FalkorDriver(GraphDriver):
         - Text search doesn't need @ prefix for content fields
         - AND is implicit with space: (@group_id:value) (text)
         - OR uses pipe within parentheses: (@group_id:value1|value2)
+
+        Note: Underscores are NOT separators in RediSearch, so group_ids with underscores
+        don't need escaping. See: https://redis.io/docs/latest/develop/ai/search-and-query/advanced-concepts/escaping/
         """
         if group_ids is None or len(group_ids) == 0:
             group_filter = ''
@@ -382,6 +385,11 @@ class FalkorDriver(GraphDriver):
         # If the query is too long return no query
         if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
             return ''
+
+        # Handle empty search query - only use group filter (avoid empty "()" which causes syntax error)
+        if not sanitized_query.strip():
+            # Return just the group filter, or '*' if no filter
+            return group_filter if group_filter else '*'
 
         full_query = group_filter + ' (' + sanitized_query + ')'
 

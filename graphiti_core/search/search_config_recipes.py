@@ -31,13 +31,14 @@ from graphiti_core.search.search_config import (
 )
 
 # Performs a hybrid search with rrf reranking over edges, nodes, and communities
+# EasyOps: Added BFS to enable multi-hop reasoning without requiring cross-encoder reranker
 COMBINED_HYBRID_SEARCH_RRF = SearchConfig(
     edge_config=EdgeSearchConfig(
-        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity, EdgeSearchMethod.bfs],
         reranker=EdgeReranker.rrf,
     ),
     node_config=NodeSearchConfig(
-        search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity],
+        search_methods=[NodeSearchMethod.bm25, NodeSearchMethod.cosine_similarity, NodeSearchMethod.bfs],
         reranker=NodeReranker.rrf,
     ),
     episode_config=EpisodeSearchConfig(
