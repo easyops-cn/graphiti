@@ -43,8 +43,17 @@ def _normalize_string_exact(name: str) -> str:
 
 
 def _normalize_name_for_fuzzy(name: str) -> str:
-    """Produce a fuzzier form that keeps alphanumerics and apostrophes for n-gram shingles."""
-    normalized = re.sub(r"[^a-z0-9' ]", ' ', _normalize_string_exact(name))
+    """Produce a fuzzier form that keeps alphanumerics and apostrophes for n-gram shingles.
+
+    EasyOps fix: Support Unicode characters (Chinese, Japanese, Korean, etc.) by using
+    Unicode-aware regex. The original [a-z0-9] only matched ASCII letters and digits,
+    which stripped all CJK characters and caused deduplication failures for non-ASCII names.
+    """
+    normalized = _normalize_string_exact(name)
+    # Use \w to match Unicode letters/digits (includes underscore)
+    # [^\w' ]|_ means: match non-word chars (except apostrophe/space) OR underscore
+    # This keeps Unicode letters, digits, apostrophes, and spaces
+    normalized = re.sub(r"[^\w' ]|_", ' ', normalized, flags=re.UNICODE)
     normalized = normalized.strip()
     return re.sub(r'[\s]+', ' ', normalized)
 
@@ -200,15 +209,19 @@ def _resolve_with_similarity(
     indexes: DedupCandidateIndexes,
     state: DedupResolutionState,
 ) -> None:
-    """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons."""
+    """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons.
+
+    EasyOps fix: Check exact match BEFORE entropy check to support non-ASCII names (e.g., Chinese).
+    The original code skipped exact matching for names with low fuzzy entropy, which caused
+    duplicate entities for Chinese names like "张三" because _normalize_name_for_fuzzy strips
+    non-ASCII characters.
+    """
     for idx, node in enumerate(extracted_nodes):
         normalized_exact = _normalize_string_exact(node.name)
         normalized_fuzzy = _normalize_name_for_fuzzy(node.name)
 
-        if not _has_high_entropy(normalized_fuzzy):
-            state.unresolved_indices.append(idx)
-            continue
-
+        # EasyOps fix: Always try exact match first, regardless of entropy.
+        # This ensures non-ASCII names (Chinese, Japanese, etc.) are deduplicated correctly.
         existing_matches = indexes.normalized_existing.get(normalized_exact, [])
         if len(existing_matches) == 1:
             match = existing_matches[0]
@@ -218,6 +231,13 @@ def _resolve_with_similarity(
                 state.duplicate_pairs.append((node, match))
             continue
         if len(existing_matches) > 1:
+            # Multiple exact matches - let LLM decide
+            state.unresolved_indices.append(idx)
+            continue
+
+        # No exact match found. For non-ASCII names (empty normalized_fuzzy), skip fuzzy matching
+        # and defer to LLM. For ASCII names, check entropy before fuzzy matching.
+        if not _has_high_entropy(normalized_fuzzy):
             state.unresolved_indices.append(idx)
             continue
 
