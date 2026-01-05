@@ -819,6 +819,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         attributes.pop('name', None)
         attributes.pop('group_id', None)
         attributes.pop('name_embedding', None)
+        attributes.pop('summary_embedding', None)  # EasyOps fix: exclude from prompt context
         attributes.pop('summary', None)
         attributes.pop('created_at', None)
         attributes.pop('labels', None)
