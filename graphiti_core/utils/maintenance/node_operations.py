@@ -380,6 +380,22 @@ async def extract_nodes(
                 group_id=episode.group_id,
                 prompt_name='extract_nodes.extract_json',
             )
+        elif episode.source == EpisodeType.document:
+            # Document extraction uses same prompt as text
+            llm_response = await llm_client.generate_response(
+                prompt_library.extract_nodes.extract_text_with_scores(context),
+                response_model=ExtractedEntitiesWithScores,
+                group_id=episode.group_id,
+                prompt_name='extract_nodes.extract_text_with_scores',
+            )
+        else:
+            # Fallback to text extraction for unknown types
+            llm_response = await llm_client.generate_response(
+                prompt_library.extract_nodes.extract_text_with_scores(context),
+                response_model=ExtractedEntitiesWithScores,
+                group_id=episode.group_id,
+                prompt_name='extract_nodes.extract_text_with_scores',
+            )
         llm_call_count += 1
         perf_logger.info(f'[PERF]     └─ extract_nodes LLM call #{llm_call_count}: {(time() - llm_start)*1000:.0f}ms')
 
