@@ -323,16 +323,54 @@ class EpisodicNode(Node):
         description='Vector embedding of the content for semantic search (document mode only)',
     )
 
+    # Content storage fields (file storage support)
+    content_hash: str | None = Field(
+        default=None,
+        description='SHA-256 hash of the content for deduplication',
+    )
+    content_storage_type: str | None = Field(
+        default=None,
+        description='Storage type: redis, local, oss, or s3',
+    )
+    content_file_path: str | None = Field(
+        default=None,
+        description='File path for stored content (None for redis mode)',
+    )
+    content_file_size: int | None = Field(
+        default=None,
+        description='Content size in bytes',
+    )
+
     async def save(self, driver: GraphDriver):
         if driver.graph_operations_interface:
             return await driver.graph_operations_interface.episodic_node_save(self, driver)
+
+        # Store content to file storage (if using FalkorDriver with content_storage)
+        content_for_db = self.content
+        if hasattr(driver, 'content_storage') and hasattr(driver, 'content_storage_type'):
+            # Store content (storage layer handles deduplication)
+            storage_result = await driver.content_storage.store(
+                episode_uuid=self.uuid,
+                group_id=self.group_id,
+                content=self.content,
+            )
+
+            # Update storage fields
+            self.content_hash = storage_result.content_hash
+            self.content_storage_type = driver.content_storage_type
+            self.content_file_path = storage_result.file_path
+            self.content_file_size = storage_result.file_size
+
+            # For file-based storage, set content=None (don't store in FalkorDB)
+            if driver.content_storage_type != 'redis':
+                content_for_db = None
 
         episode_args = {
             'uuid': self.uuid,
             'name': self.name,
             'group_id': self.group_id,
             'source_description': self.source_description,
-            'content': self.content,
+            'content': content_for_db,  # None for file storage, content for redis
             'entity_edges': self.entity_edges,
             'created_at': self.created_at,
             'valid_at': self.valid_at,
@@ -341,6 +379,11 @@ class EpisodicNode(Node):
             'summary': self.summary,
             'tags': self.tags or [],
             'content_embedding': self.content_embedding,
+            # Content storage fields
+            'content_hash': self.content_hash,
+            'content_storage_type': self.content_storage_type,
+            'content_file_path': self.content_file_path,
+            'content_file_size': self.content_file_size,
         }
 
         result = await driver.execute_query(
@@ -807,6 +850,11 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
         # Document mode fields
         summary=record.get('summary'),
         tags=record.get('tags'),
+        # Content storage fields
+        content_hash=record.get('content_hash'),
+        content_storage_type=record.get('content_storage_type'),
+        content_file_path=record.get('content_file_path'),
+        content_file_size=record.get('content_file_size'),
     )
 
 

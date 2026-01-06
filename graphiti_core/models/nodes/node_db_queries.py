@@ -55,7 +55,11 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
                         WHEN $content_embedding IS NOT NULL AND size($content_embedding) > 0
                         THEN vecf32($content_embedding)
                         ELSE NULL
-                    END
+                    END,
+                    n.content_hash = $content_hash,
+                    n.content_storage_type = $content_storage_type,
+                    n.content_file_path = $content_file_path,
+                    n.content_file_size = $content_file_size
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
@@ -121,7 +125,11 @@ EPISODIC_NODE_RETURN = """
     e.valid_at AS valid_at,
     e.entity_edges AS entity_edges,
     e.summary AS summary,
-    e.tags AS tags
+    e.tags AS tags,
+    e.content_hash AS content_hash,
+    e.content_storage_type AS content_storage_type,
+    e.content_file_path AS content_file_path,
+    e.content_file_size AS content_file_size
 """
 
 EPISODIC_NODE_RETURN_NEPTUNE = """

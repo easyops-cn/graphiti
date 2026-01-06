@@ -19,6 +19,11 @@ import datetime
 import logging
 from typing import TYPE_CHECKING, Any
 
+# Import storage classes
+from graphiti_core.storage.content_storage import ContentStorage, StorageResult
+from graphiti_core.storage.local_storage import LocalFileStorage
+from graphiti_core.storage.redis_storage import RedisContentStorage
+
 if TYPE_CHECKING:
     from falkordb import Graph as FalkorGraph
     from falkordb.asyncio import FalkorDB
@@ -143,6 +148,9 @@ class FalkorDriver(GraphDriver):
         falkor_db: FalkorDB | None = None,
         database: str = 'default_db',
         embedding_dimension: int = 1024,
+        # NEW: Content storage configuration
+        content_storage_type: str = 'local',  # redis | local | oss | s3
+        content_storage_config: dict | None = None,
     ):
         """
         Initialize the FalkorDB driver.
@@ -159,6 +167,8 @@ class FalkorDriver(GraphDriver):
         falkor_db (FalkorDB | None): An existing FalkorDB instance to use instead of creating a new one.
         database (str): The name of the database to connect to. Defaults to 'default_db'.
         embedding_dimension (int): Vector embedding dimension. Defaults to 1024 (qwen3-embedding).
+        content_storage_type (str): Type of content storage (redis, local, oss, s3). Defaults to 'local'.
+        content_storage_config (dict | None): Configuration dict for content storage backend.
         """
         super().__init__()
         # Ensure database is not empty (FalkorDB 1.2.0 requires non-empty database name)
@@ -173,6 +183,10 @@ class FalkorDriver(GraphDriver):
         else:
             self.client = FalkorDB(host=host, port=port, username=username, password=password)
 
+        # NEW: Initialize content storage
+        self.content_storage_type = content_storage_type
+        self.content_storage = self._create_storage(content_storage_type, content_storage_config or {})
+
         # Schedule the indices and constraints to be built
         try:
             # Try to get the current event loop
@@ -182,6 +196,34 @@ class FalkorDriver(GraphDriver):
         except RuntimeError:
             # No event loop running, this will be handled later
             pass
+
+    def _create_storage(self, storage_type: str, config: dict) -> ContentStorage:
+        """
+        Factory method: create storage instance based on type
+
+        Args:
+            storage_type: Storage type (redis, local, oss, s3)
+            config: Configuration dict for the storage backend
+
+        Returns:
+            ContentStorage instance
+
+        Raises:
+            ValueError: If storage_type is unknown
+        """
+        if storage_type == 'redis':
+            return RedisContentStorage()
+        elif storage_type == 'local':
+            base_path = config.get('base_path', './data/episodes')
+            return LocalFileStorage(base_path=base_path)
+        elif storage_type == 'oss':
+            # TODO: Implement OSS storage
+            raise NotImplementedError('OSS storage is not yet implemented')
+        elif storage_type == 's3':
+            # TODO: Implement S3 storage
+            raise NotImplementedError('S3 storage is not yet implemented')
+        else:
+            raise ValueError(f'Unknown storage type: {storage_type}')
 
     def _get_graph(self, graph_name: str | None) -> FalkorGraph:
         # FalkorDB requires a non-None database name for multi-tenant graphs; the default is "default_db"
@@ -296,10 +338,21 @@ class FalkorDriver(GraphDriver):
         if database == self._database:
             cloned = self
         elif database == self.default_group_id:
-            cloned = FalkorDriver(falkor_db=self.client, embedding_dimension=self._embedding_dimension, content_storage_type=self.content_storage_type, content_storage_config={})
+            cloned = FalkorDriver(
+                falkor_db=self.client,
+                embedding_dimension=self._embedding_dimension,
+                content_storage_type=self.content_storage_type,
+                content_storage_config={},
+            )
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
-            cloned = FalkorDriver(falkor_db=self.client, database=database, embedding_dimension=self._embedding_dimension)
+            cloned = FalkorDriver(
+                falkor_db=self.client,
+                database=database,
+                embedding_dimension=self._embedding_dimension,
+                content_storage_type=self.content_storage_type,
+                content_storage_config={},
+            )
 
         return cloned
 
@@ -413,3 +466,34 @@ class FalkorDriver(GraphDriver):
         full_query = group_filter + ' (' + sanitized_query + ')'
 
         return full_query
+
+    async def load_episode_content(
+        self, episode: 'EpisodicNode', max_length: int | None = None
+    ) -> str:
+        """
+        Load episode content from storage if needed.
+
+        Args:
+            episode: EpisodicNode to load content for
+            max_length: Optional max length to truncate content
+
+        Returns:
+            Episode content (loaded from storage if content field is empty)
+        """
+        # If content is already populated, return it
+        if episode.content:
+            if max_length and len(episode.content) > max_length:
+                return episode.content[:max_length]
+            return episode.content
+
+        # If content is empty but we have file storage metadata, retrieve from storage
+        if episode.content_file_path or episode.content_storage_type == 'redis':
+            content = await self.content_storage.retrieve(
+                file_path=episode.content_file_path,
+                content=episode.content,  # May be None or empty
+                max_length=max_length,
+            )
+            return content
+
+        # No content available
+        return ''

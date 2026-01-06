@@ -64,6 +64,7 @@ from graphiti_core.search.search_utils import (
     RELEVANT_SCHEMA_LIMIT,
     get_mentioned_nodes,
 )
+from graphiti_core.storage.content_storage import StorageResult
 from graphiti_core.telemetry import capture_event
 from graphiti_core.tracer import Tracer, create_tracer
 from graphiti_core.utils.bulk_utils import (
@@ -435,7 +436,58 @@ class Graphiti:
         episodic_edges = build_episodic_edges(nodes, episode.uuid, now)
         episode.entity_edges = [edge.uuid for edge in entity_edges]
 
-        if not self.store_raw_episode_content:
+        # Content storage integration (only for FalkorDB driver with content_storage)
+        if hasattr(self.driver, 'content_storage') and hasattr(self.driver, 'content_storage_type'):
+            original_content = episode.content
+
+            # Compute hash and check for duplicates (for file modes)
+            content_hash = await self.driver.content_storage.compute_hash(original_content)
+            episode.content_hash = content_hash
+
+            # Check for duplicate content (deduplication - only for file modes)
+            existing_file_path = None
+            if self.driver.content_storage_type != 'redis':
+                # Query FalkorDB for existing file with same hash
+                query = """
+                MATCH (e:Episodic {content_hash: $hash})
+                WHERE e.content_file_path IS NOT NULL
+                RETURN e.content_file_path AS file_path
+                LIMIT 1
+                """
+                try:
+                    records, _, _ = await self.driver.execute_query(query, hash=content_hash)
+                    if records:
+                        existing_file_path = records[0]['file_path']
+                except Exception:
+                    # Query might fail if no such property exists yet, that's fine
+                    pass
+
+            # Store content using content_storage
+            if existing_file_path:
+                # Deduplication: reuse existing file
+                storage_result = StorageResult(
+                    file_path=existing_file_path,
+                    content_hash=content_hash,
+                    file_size=len(original_content.encode('utf-8')),
+                )
+            else:
+                # New content: store it
+                storage_result = await self.driver.content_storage.store(
+                    episode_uuid=episode.uuid,
+                    group_id=episode.group_id,
+                    content=original_content,
+                )
+
+            # Update episode metadata
+            episode.content_storage_type = self.driver.content_storage_type
+            episode.content_file_path = storage_result.file_path
+            episode.content_file_size = storage_result.file_size
+
+            # Clear content field for file modes (keep it for redis mode)
+            if self.driver.content_storage_type != 'redis':
+                episode.content = None
+        elif not self.store_raw_episode_content:
+            # Legacy behavior: clear content if store_raw_episode_content is False
             episode.content = ''
 
         await add_nodes_and_edges_bulk(
