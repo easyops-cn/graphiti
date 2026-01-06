@@ -142,6 +142,7 @@ class FalkorDriver(GraphDriver):
         password: str | None = None,
         falkor_db: FalkorDB | None = None,
         database: str = 'default_db',
+        embedding_dimension: int = 1024,
     ):
         """
         Initialize the FalkorDB driver.
@@ -157,9 +158,15 @@ class FalkorDriver(GraphDriver):
         password (str | None): The password for authentication (if required).
         falkor_db (FalkorDB | None): An existing FalkorDB instance to use instead of creating a new one.
         database (str): The name of the database to connect to. Defaults to 'default_db'.
+        embedding_dimension (int): Vector embedding dimension. Defaults to 1024 (qwen3-embedding).
         """
         super().__init__()
+        # Ensure database is not empty (FalkorDB 1.2.0 requires non-empty database name)
+        if not database or not database.strip():
+            logger.warning(f"Empty database name provided, using default 'default_db'")
+            database = 'default_db'
         self._database = database
+        self._embedding_dimension = embedding_dimension
         if falkor_db is not None:
             # If a FalkorDB instance is provided, use it directly
             self.client = falkor_db
@@ -269,6 +276,18 @@ class FalkorDriver(GraphDriver):
         for query in index_queries:
             await self.execute_query(query)
 
+        # Create vector index for Episodic.content_embedding (Document mode fast lane)
+        # This index enables semantic search on episodes before entity extraction completes
+        try:
+            await self.execute_query(
+                f"CREATE VECTOR INDEX FOR (e:Episodic) ON (e.content_embedding) "
+                f"OPTIONS {{dimension:{self._embedding_dimension}, similarityFunction:'cosine'}}"
+            )
+        except Exception as e:
+            # Index may already exist
+            if 'already indexed' not in str(e).lower() and 'already exists' not in str(e).lower():
+                logger.warning(f"Failed to create Episodic content_embedding vector index: {e}")
+
     def clone(self, database: str) -> 'GraphDriver':
         """
         Returns a shallow copy of this driver with a different default database.
@@ -277,10 +296,10 @@ class FalkorDriver(GraphDriver):
         if database == self._database:
             cloned = self
         elif database == self.default_group_id:
-            cloned = FalkorDriver(falkor_db=self.client)
+            cloned = FalkorDriver(falkor_db=self.client, embedding_dimension=self._embedding_dimension, content_storage_type=self.content_storage_type, content_storage_config={})
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
-            cloned = FalkorDriver(falkor_db=self.client, database=database)
+            cloned = FalkorDriver(falkor_db=self.client, database=database, embedding_dimension=self._embedding_dimension)
 
         return cloned
 
