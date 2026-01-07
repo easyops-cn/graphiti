@@ -317,8 +317,11 @@ class EntityEdge(Edge):
 
     @classmethod
     async def get_by_uuid(cls, driver: GraphDriver, uuid: str):
+        # EasyOps fix: Search for any edge type between Entity nodes, not just RELATES_TO
+        # This supports custom edge types defined in Schema (e.g., LIKES, WORKS_AT)
         match_query = """
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
+            MATCH (n:Entity)-[e]->(m:Entity)
+            WHERE e.uuid = $uuid
         """
         if driver.provider == GraphProvider.KUZU:
             match_query = """

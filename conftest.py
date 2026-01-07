@@ -5,6 +5,11 @@ import sys
 # Without this file, you might encounter ModuleNotFoundError when trying to import modules from your project, especially when running tests.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from tests.helpers_test import graph_driver, mock_embedder
-
-__all__ = ['graph_driver', 'mock_embedder']
+# Only import test helpers when actually running graphiti tests
+# This prevents import errors when running elevo_memory tests
+try:
+    from tests.helpers_test import graph_driver, mock_embedder
+    __all__ = ['graph_driver', 'mock_embedder']
+except ImportError:
+    # Running from elevo_memory, skip graphiti test fixtures
+    __all__ = []
