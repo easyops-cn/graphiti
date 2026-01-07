@@ -116,5 +116,9 @@ async def retrieve_episodes(
         **query_params,
     )
 
-    episodes = [get_episodic_node_from_record(record) for record in result]
+    # Prepare records (load content from external storage if driver supports it)
+    processed_records = [await driver.prepare_episode_record(record) for record in result]
+
+    episodes = [get_episodic_node_from_record(record) for record in processed_records]
+
     return list(reversed(episodes))  # Return in chronological order

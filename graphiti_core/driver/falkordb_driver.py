@@ -497,3 +497,65 @@ class FalkorDriver(GraphDriver):
 
         # No content available
         return ''
+
+    async def prepare_episode_record(self, record: dict) -> dict:
+        """
+        Prepare episode record by loading content from file storage if needed.
+
+        This method is called before creating EpisodicNode to ensure content
+        is populated (required field) even when using file-based storage.
+
+        Args:
+            record: Database record dict with episode data
+
+        Returns:
+            Record dict with content loaded from storage if applicable
+        """
+        if record.get('content') is None and record.get('content_file_path'):
+            content = await self.content_storage.retrieve(
+                file_path=record['content_file_path'],
+                content=None,
+                max_length=None,
+            )
+            record = dict(record)  # Make mutable copy
+            record['content'] = content or ''
+        return record
+
+    async def prepare_episode_for_save(self, episode: dict) -> dict:
+        """
+        Prepare episode dict for saving by storing content to file storage.
+
+        This method is called before bulk saving episodes to:
+        1. Store content to file storage
+        2. Set storage metadata fields (content_hash, content_file_path, etc.)
+        3. Replace content with empty string (FalkorDB stores only metadata)
+
+        Args:
+            episode: Episode dict with content to store
+
+        Returns:
+            Episode dict with content stored and metadata set
+        """
+        content = episode.get('content')
+        if not content:
+            return episode
+
+        # Store content to file storage
+        storage_result = await self.content_storage.store(
+            episode_uuid=episode['uuid'],
+            group_id=episode['group_id'],
+            content=content,
+        )
+
+        # Update episode with storage metadata
+        episode['content_hash'] = storage_result.content_hash
+        episode['content_storage_type'] = self.content_storage_type
+        episode['content_file_path'] = storage_result.file_path
+        episode['content_file_size'] = storage_result.file_size
+
+        # For file-based storage, set content to empty string (not None)
+        # This ensures EpisodicNode validation passes when reading back
+        if self.content_storage_type != 'redis':
+            episode['content'] = ''
+
+        return episode

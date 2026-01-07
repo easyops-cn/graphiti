@@ -20,12 +20,15 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
 from graphiti_core.driver.graph_operations.graph_operations import GraphOperationsInterface
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
+
+if TYPE_CHECKING:
+    from graphiti_core.nodes import EpisodicNode
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +125,56 @@ class GraphDriver(ABC):
         Only implemented by providers that need custom fulltext query building.
         """
         raise NotImplementedError(f'build_fulltext_query not implemented for {self.provider}')
+
+    async def prepare_episode_for_save(self, episode: dict) -> dict:
+        """
+        Prepare episode dict for saving to database.
+
+        Default implementation returns episode unchanged.
+        Override in drivers that use external content storage (e.g., FalkorDB with file storage)
+        to store content externally and update metadata fields.
+
+        Args:
+            episode: Episode dict with content to store
+
+        Returns:
+            Episode dict ready for database insertion
+        """
+        return episode
+
+    async def prepare_episode_record(self, record: dict) -> dict:
+        """
+        Prepare episode record after loading from database.
+
+        Default implementation returns record unchanged.
+        Override in drivers that use external content storage to load content
+        from storage before creating EpisodicNode.
+
+        Args:
+            record: Database record dict with episode data
+
+        Returns:
+            Record dict with content loaded if applicable
+        """
+        return record
+
+    async def load_episode_content(
+        self, episode: 'EpisodicNode', max_length: int | None = None
+    ) -> str:
+        """
+        Load episode content from storage if needed.
+
+        Default implementation returns episode.content directly.
+        Override in drivers that use external content storage (e.g., FalkorDB with file storage).
+
+        Args:
+            episode: EpisodicNode to load content for
+            max_length: Optional max length to truncate content
+
+        Returns:
+            Episode content (loaded from storage if content field is empty)
+        """
+        content = episode.content or ''
+        if max_length and len(content) > max_length:
+            return content[:max_length]
+        return content

@@ -985,6 +985,9 @@ async def add_nodes_and_edges_bulk_tx(
             if 'source_description' in episode and episode['source_description']:
                 episode['source_description'] = _sanitize_string_for_falkordb(episode['source_description'])
 
+    # Prepare episodes for save (handles external content storage if driver supports it)
+    episodes = [await driver.prepare_episode_for_save(ep) for ep in episodes]
+
     nodes = []
 
     for node in entity_nodes:
