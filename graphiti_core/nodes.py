@@ -300,7 +300,9 @@ class Node(BaseModel, ABC):
 class EpisodicNode(Node):
     source: EpisodeType = Field(description='source type')
     source_description: str = Field(description='description of the data source')
-    content: str = Field(description='raw episode data')
+    # EasyOps fix: content can be None when using file storage
+    # (content is stored externally and database field is NULL)
+    content: str | None = Field(default=None, description='raw episode data')
     valid_at: datetime = Field(
         description='datetime of when the original document was created',
     )

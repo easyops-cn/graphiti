@@ -72,9 +72,12 @@ class Edge(BaseModel, ABC):
                 uuid=self.uuid,
             )
         else:
+            # EasyOps fix: Support deleting any edge type by UUID, not just MENTIONS|RELATES_TO|HAS_MEMBER
+            # This supports custom edge types defined in Schema (e.g., HOSTS, MANAGES)
             await driver.execute_query(
                 """
-                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
+                MATCH (n)-[e]->(m)
+                WHERE e.uuid = $uuid
                 DELETE e
                 """,
                 uuid=self.uuid,
