@@ -437,7 +437,12 @@ class Graphiti:
         episode.entity_edges = [edge.uuid for edge in entity_edges]
 
         # Content storage integration (only for FalkorDB driver with content_storage)
-        if hasattr(self.driver, 'content_storage') and hasattr(self.driver, 'content_storage_type'):
+        # Skip if content already stored (fast lane enrichment scenario: content_hash exists)
+        if (
+            hasattr(self.driver, 'content_storage')
+            and hasattr(self.driver, 'content_storage_type')
+            and episode.content_hash is None  # Only process if content not already stored
+        ):
             original_content = episode.content
 
             # Compute hash and check for duplicates (for file modes)
