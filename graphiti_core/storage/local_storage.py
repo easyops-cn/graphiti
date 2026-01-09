@@ -6,7 +6,6 @@ Local File Storage
 """
 
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 
 import aiofiles
@@ -35,7 +34,7 @@ class LocalFileStorage:
         """
         存储内容到本地文件
 
-        文件路径格式: {base_path}/{group_id}/{year}/{month}/{content_hash}.txt
+        文件路径格式: {base_path}/{group_id}/{content_hash}.txt
         使用 content_hash 作为文件名，相同内容自动去重
 
         Args:
@@ -50,8 +49,7 @@ class LocalFileStorage:
         content_hash = await self.compute_hash(content)
 
         # 2. 生成文件路径（使用 hash 作为文件名）
-        now = datetime.now(timezone.utc)
-        file_path = f"{group_id}/{now.year}/{now.month:02d}/{content_hash}.txt"
+        file_path = f"{group_id}/{content_hash}.txt"
         full_path = self.base_path / file_path
 
         # 3. 如果文件已存在，直接返回（去重）
