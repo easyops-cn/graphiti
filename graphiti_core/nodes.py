@@ -417,7 +417,13 @@ class EpisodicNode(Node):
         if len(episodes) == 0:
             raise NodeNotFoundError(uuid)
 
-        return episodes[0]
+        episode = episodes[0]
+
+        # Auto-load content from storage if needed (file storage mode)
+        if not episode.content:
+            episode.content = await driver.load_episode_content(episode)
+
+        return episode
 
     @classmethod
     async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str]):
@@ -437,6 +443,11 @@ class EpisodicNode(Node):
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
+
+        # Auto-load content from storage if needed (file storage mode)
+        for episode in episodes:
+            if not episode.content:
+                episode.content = await driver.load_episode_content(episode)
 
         return episodes
 
@@ -477,6 +488,11 @@ class EpisodicNode(Node):
 
         episodes = [get_episodic_node_from_record(record) for record in records]
 
+        # Auto-load content from storage if needed (file storage mode)
+        for episode in episodes:
+            if not episode.content:
+                episode.content = await driver.load_episode_content(episode)
+
         return episodes
 
     @classmethod
@@ -496,6 +512,11 @@ class EpisodicNode(Node):
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
+
+        # Auto-load content from storage if needed (file storage mode)
+        for episode in episodes:
+            if not episode.content:
+                episode.content = await driver.load_episode_content(episode)
 
         return episodes
 

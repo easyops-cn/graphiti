@@ -151,6 +151,8 @@ class FalkorDriver(GraphDriver):
         # NEW: Content storage configuration
         content_storage_type: str = 'local',  # redis | local | oss | s3
         content_storage_config: dict | None = None,
+        # Flag to skip index building (used for cloned drivers)
+        skip_index_build: bool = False,
     ):
         """
         Initialize the FalkorDB driver.
@@ -169,6 +171,7 @@ class FalkorDriver(GraphDriver):
         embedding_dimension (int): Vector embedding dimension. Defaults to 1024 (qwen3-embedding).
         content_storage_type (str): Type of content storage (redis, local, oss, s3). Defaults to 'local'.
         content_storage_config (dict | None): Configuration dict for content storage backend.
+        skip_index_build (bool): Skip building indices (used for cloned drivers). Defaults to False.
         """
         super().__init__()
         # Ensure database is not empty (FalkorDB 1.2.0 requires non-empty database name)
@@ -187,15 +190,16 @@ class FalkorDriver(GraphDriver):
         self.content_storage_type = content_storage_type
         self.content_storage = self._create_storage(content_storage_type, content_storage_config or {})
 
-        # Schedule the indices and constraints to be built
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_running_loop()
-            # Schedule the build_indices_and_constraints to run
-            loop.create_task(self.build_indices_and_constraints())
-        except RuntimeError:
-            # No event loop running, this will be handled later
-            pass
+        # Schedule the indices and constraints to be built (skip for cloned drivers)
+        if not skip_index_build:
+            try:
+                # Try to get the current event loop
+                loop = asyncio.get_running_loop()
+                # Schedule the build_indices_and_constraints to run
+                loop.create_task(self.build_indices_and_constraints())
+            except RuntimeError:
+                # No event loop running, this will be handled later
+                pass
 
     def _create_storage(self, storage_type: str, config: dict) -> ContentStorage:
         """
@@ -312,23 +316,38 @@ class FalkorDriver(GraphDriver):
             await asyncio.gather(*drop_tasks)
 
     async def build_indices_and_constraints(self, delete_existing=False):
-        if delete_existing:
-            await self.delete_all_indexes()
-        index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
-        for query in index_queries:
-            await self.execute_query(query)
-
-        # Create vector index for Episodic.content_embedding (Document mode fast lane)
-        # This index enables semantic search on episodes before entity extraction completes
         try:
-            await self.execute_query(
-                f"CREATE VECTOR INDEX FOR (e:Episodic) ON (e.content_embedding) "
-                f"OPTIONS {{dimension:{self._embedding_dimension}, similarityFunction:'cosine'}}"
-            )
+            if delete_existing:
+                await self.delete_all_indexes()
+            index_queries = get_range_indices(self.provider) + get_fulltext_indices(self.provider)
+            for query in index_queries:
+                try:
+                    await self.execute_query(query)
+                except Exception as e:
+                    # Handle connection errors gracefully
+                    if 'connection closed' in str(e).lower() or 'connectionerror' in str(type(e).__name__).lower():
+                        logger.warning(f"Connection error while building index, skipping: {e}")
+                        continue
+                    # Re-raise other errors
+                    raise
+
+            # Create vector index for Episodic.content_embedding (Document mode fast lane)
+            # This index enables semantic search on episodes before entity extraction completes
+            try:
+                await self.execute_query(
+                    f"CREATE VECTOR INDEX FOR (e:Episodic) ON (e.content_embedding) "
+                    f"OPTIONS {{dimension:{self._embedding_dimension}, similarityFunction:'cosine'}}"
+                )
+            except Exception as e:
+                # Index may already exist or connection error
+                if 'already indexed' not in str(e).lower() and 'already exists' not in str(e).lower():
+                    if 'connection closed' in str(e).lower() or 'connectionerror' in str(type(e).__name__).lower():
+                        logger.warning(f"Connection error while creating Episodic vector index: {e}")
+                    else:
+                        logger.warning(f"Failed to create Episodic content_embedding vector index: {e}")
         except Exception as e:
-            # Index may already exist
-            if 'already indexed' not in str(e).lower() and 'already exists' not in str(e).lower():
-                logger.warning(f"Failed to create Episodic content_embedding vector index: {e}")
+            # Catch any unexpected errors to prevent background task from crashing
+            logger.error(f"Error in build_indices_and_constraints: {e}", exc_info=True)
 
     def clone(self, database: str) -> 'GraphDriver':
         """
@@ -343,6 +362,7 @@ class FalkorDriver(GraphDriver):
                 embedding_dimension=self._embedding_dimension,
                 content_storage_type=self.content_storage_type,
                 content_storage_config={},
+                skip_index_build=True,  # Skip index building for cloned drivers
             )
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
@@ -352,6 +372,7 @@ class FalkorDriver(GraphDriver):
                 embedding_dimension=self._embedding_dimension,
                 content_storage_type=self.content_storage_type,
                 content_storage_config={},
+                skip_index_build=True,  # Skip index building for cloned drivers
             )
 
         return cloned
