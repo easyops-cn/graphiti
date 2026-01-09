@@ -34,7 +34,8 @@ class LocalFileStorage:
         """
         存储内容到本地文件
 
-        文件路径格式: {base_path}/{group_id}/{content_hash}.txt
+        文件路径格式: {base_path}/{group_id}/{hash前2位}/{content_hash}.txt
+        使用 hash 前 2 位分目录（256 个桶），支持百万级文件
         使用 content_hash 作为文件名，相同内容自动去重
 
         Args:
@@ -48,8 +49,9 @@ class LocalFileStorage:
         # 1. 计算 content hash
         content_hash = await self.compute_hash(content)
 
-        # 2. 生成文件路径（使用 hash 作为文件名）
-        file_path = f"{group_id}/{content_hash}.txt"
+        # 2. 生成文件路径（使用 hash 前 2 位分目录，类似 git 对象存储）
+        hash_prefix = content_hash[:2]
+        file_path = f"{group_id}/{hash_prefix}/{content_hash}.txt"
         full_path = self.base_path / file_path
 
         # 3. 如果文件已存在，直接返回（去重）
