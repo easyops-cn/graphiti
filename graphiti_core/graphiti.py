@@ -703,8 +703,8 @@ class Graphiti:
             The number of episodes to retrieve. Defaults to EPISODE_WINDOW_LEN.
         group_ids : list[str | None], optional
             The group ids to return data from.
-        user_id : str | None, optional
-            Filter episodes by user ID for data isolation.
+        user_ids : list[str] | None, optional
+            Filter episodes by user IDs for data isolation.
 
         Returns
         -------
