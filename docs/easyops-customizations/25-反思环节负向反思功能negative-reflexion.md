@@ -191,6 +191,51 @@ if reflexion_result.facts_to_correct:
 missing_facts = reflexion_result.missing_facts
 ```
 
+### 25.7 Edge Reflexion 提示词增强：互斥约束 + 语义等价
+
+**文件**: `graphiti_core/prompts/extract_edges.py`
+
+**问题**: LLM 经常将同一问题同时报到多个 channel（如 wrong_direction 的事实既放入 `facts_to_correct`，又把修正后的版本放入 `missing_facts`），导致下游重复处理。此外，LLM 对措辞略有不同但语义相同的事实（如 "works on Chen's team" vs "is a member of Chen's team"）误报为遗漏。
+
+**修改内容**:
+
+1. System prompt 添加语义等价容忍规则：
+```
+Treat semantically equivalent paraphrases as correct extractions.
+Minor differences in articles, prepositions, or word order that preserve
+the core meaning should NOT be flagged in any category.
+```
+
+2. User prompt 添加 Priority Rules（互斥约束）：
+```
+## Priority Rules
+- If an extracted fact has wrong relation_type or direction, put it in facts_to_correct ONLY.
+  Do NOT also add the corrected version to missing_facts.
+- If an extracted fact is completely wrong (hallucinated), put it in facts_to_remove ONLY.
+- Only use missing_facts for relationships that have NO corresponding extracted fact at all.
+- Each issue should appear in exactly ONE category.
+- Describe missing_facts in natural language, not SCREAMING_SNAKE_CASE.
+```
+
+### 25.8 wrong_direction 下游实现
+
+**文件**: `graphiti_core/utils/maintenance/edge_operations.py`
+
+**问题**: `FactCorrection` 模型和提示词已定义 `wrong_direction` issue 类型，但下游代码只处理了 `wrong_relation_type` 和 `nonexistent_relationship`，`wrong_direction` 被静默跳过。
+
+**修改内容**: 添加 `wrong_direction` 的处理逻辑，交换 source 和 target entity ID：
+
+```python
+elif correction.issue == 'wrong_direction':
+    edge_data.source_entity_id, edge_data.target_entity_id = (
+        edge_data.target_entity_id, edge_data.source_entity_id
+    )
+    logger.info(
+        f'Corrected direction for fact "{edge_data.fact}": '
+        f'swapped source/target entity IDs'
+    )
+```
+
 ## 关键设计原则
 
 1. **不增加 LLM 调用次数**：在同一个 reflexion 调用中完成正向和负向反思
@@ -216,5 +261,7 @@ missing_facts = reflexion_result.missing_facts
 | `graphiti_core/utils/maintenance/node_operations.py` | `extract_nodes_reflexion()` 接收 `entity_types_context`，返回完整 `MissedEntities` |
 | `graphiti_core/utils/maintenance/node_operations.py` | `extract_nodes()` 处理负向反思结果 |
 | `graphiti_core/utils/maintenance/edge_operations.py` | `extract_edges()` 处理负向反思结果 |
+| `graphiti_core/prompts/extract_edges.py` | `reflexion()` 添加互斥约束和语义等价容忍规则 |
+| `graphiti_core/utils/maintenance/edge_operations.py` | `wrong_direction` 下游实现：交换 source/target entity ID |
 
 ---

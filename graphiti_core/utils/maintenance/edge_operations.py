@@ -201,6 +201,14 @@ async def extract_edges(
                                 f'Corrected relation_type for fact "{edge_data.fact}": '
                                 f'{old_type} -> {correction.corrected_relation_type}'
                             )
+                        elif correction.issue == 'wrong_direction':
+                            edge_data.source_entity_id, edge_data.target_entity_id = (
+                                edge_data.target_entity_id, edge_data.source_entity_id
+                            )
+                            logger.info(
+                                f'Corrected direction for fact "{edge_data.fact}": '
+                                f'swapped source/target entity IDs'
+                            )
                         elif correction.issue == 'nonexistent_relationship':
                             # Mark for removal
                             facts_to_remove_set = facts_to_remove_set if facts_to_remove else set()

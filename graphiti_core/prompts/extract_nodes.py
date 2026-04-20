@@ -365,6 +365,7 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
 5. **Exclusions**:
    - Do NOT extract entities representing relationships or actions.
    - Do NOT extract dates, times, or other temporal information—these will be handled separately.
+   - Do NOT extract entities from hypothetical, conditional, or speculative statements (e.g., "如果我们有...", "If we had...", "We should consider..."). Only extract entities that actually exist or are asserted as facts.
 
 6. **Formatting**:
    - Be **explicit and unambiguous** in naming entities (e.g., use full names when available).
@@ -437,9 +438,10 @@ Guidelines:
 1. Extract significant entities, concepts, or actors mentioned in the conversation.
 2. Avoid creating nodes for relationships or actions.
 3. Avoid creating nodes for temporal information like dates, times or years (these will be added to edges later).
-4. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
-5. **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each entity type description to ensure correct classification.
-6. **Reasoning Requirement**: For each extracted entity, provide a brief `reasoning` (1-2 sentences) explaining:
+4. Do NOT extract entities from hypothetical, conditional, or speculative statements (e.g., "如果我们有...", "If we had...", "We should consider..."). Only extract entities that actually exist or are asserted as facts.
+5. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
+6. **CRITICAL**: Carefully read the 【是】(IS) and 【不是】(IS NOT) examples in each entity type description to ensure correct classification.
+7. **Reasoning Requirement**: For each extracted entity, provide a brief `reasoning` (1-2 sentences) explaining:
    - Why you identified this as a significant entity
    - Why the chosen entity_type_id is correct based on the ENTITY TYPES descriptions
    - This forces careful consideration before classification.
@@ -496,7 +498,8 @@ For each extracted entity:
 **ENTITY EXTRACTION GUIDELINES**:
 1. Extract significant entities, concepts, or actors mentioned in the text
 2. Avoid creating nodes for relationships, actions, or temporal information
-3. Be explicit in entity names, using full names when available
+3. Do NOT extract entities from hypothetical, conditional, or speculative statements. Only extract entities that actually exist or are asserted as facts.
+4. Be explicit in entity names, using full names when available
 """
     return [
         Message(role='system', content=sys_prompt),
@@ -539,6 +542,7 @@ Extract entities from the CURRENT MESSAGE. For each entity, output ONLY the top 
 1. Always extract the speaker as the first entity
 2. Extract significant entities mentioned in CURRENT MESSAGE only
 3. Disambiguate pronouns to actual entity names
+4. Do NOT extract entities from hypothetical, conditional, or speculative statements. Only extract entities that actually exist or are asserted as facts.
 
 **SCORING GUIDELINES**:
 - Score 0.9-1.0: Perfect match - entity clearly fits the type's IS examples
@@ -587,6 +591,15 @@ An entity should be REMOVED if it fails ANY of these principles AND cannot be re
                 entity_types_ref += f"- {name}: {desc}\n"
         entity_types_ref += '</VALID ENTITY TYPES>\n'
 
+    # Format extracted entities: support both list[str] (legacy) and list[dict] (with type)
+    entities_list = context['extracted_entities']
+    if entities_list and isinstance(entities_list[0], dict):
+        entities_display = '\n'.join(
+            f"- {e['name']} (current type: {e.get('type', 'Entity')})" for e in entities_list
+        )
+    else:
+        entities_display = '\n'.join(f'- {e}' for e in entities_list)
+
     user_prompt = f"""
 <PREVIOUS MESSAGES>
 {to_prompt_json([ep for ep in context['previous_episodes']])}
@@ -596,7 +609,7 @@ An entity should be REMOVED if it fails ANY of these principles AND cannot be re
 </CURRENT MESSAGE>
 
 <EXTRACTED ENTITIES>
-{context['extracted_entities']}
+{entities_display}
 </EXTRACTED ENTITIES>
 {entity_types_ref}
 Review the extraction quality and provide:
@@ -609,13 +622,15 @@ Review the extraction quality and provide:
    - Are transient/temporary concepts with no lasting value
    - Are document artifacts, not real domain knowledge
    - Cannot meaningfully connect to other entities
-   - MISCLASSIFIED and don't match ANY valid type
+   - **Before removing**, check if the entity matches ANY valid type in VALID ENTITY TYPES.
+     If it does, put it in entities_to_reclassify instead. Only remove if it fails ALL valid types.
 
 3. **entities_to_reclassify**: Entities with wrong type assignment
    - For each entity with a pre-assigned type, RE-VALIDATE against that type's definition
    - Check if it matches the type's IS examples (keep current type)
    - Check if it matches the type's IS NOT examples (needs reclassification)
-   - Only include if the entity matches a DIFFERENT valid type
+   - **Only include if the entity's type actually CHANGES to a DIFFERENT valid type**
+   - If re-validation confirms the current type is correct, do NOT include it
    - Provide: name, new_type (must be exact match from VALID ENTITY TYPES), reason
 
 **Common Misclassifications to Watch For**:
@@ -678,9 +693,10 @@ Use the summary to better understand what the entity represents.
    - Check if it matches the IS NOT examples (needs reclassification or removal)
    - If MISCLASSIFIED but matches a DIFFERENT valid type → add to entities_to_reclassify
    - If MISCLASSIFIED and doesn't match ANY valid type → add to entities_to_remove
-2. If the entity has no type or type is "Entity", check if it matches any valid type:
-   - If it matches a valid type → add to entities_to_reclassify with the correct type
-   - If it doesn't match any type, apply the four principles strictly
+2. If the entity has no type or type is "Entity", you MUST check it against EACH valid type before considering removal:
+   - Compare the entity's name and summary against each type's definition and examples
+   - If it matches ANY valid type → add to entities_to_reclassify (do NOT remove)
+   - Only if it fails ALL valid types AND fails the four principles → add to entities_to_remove
 
 **Common Misclassifications to Watch For**:
 - Metric IDs (like system_cpu_cores, system_memory_total) are NOT Components - Components are deployable services
@@ -722,7 +738,7 @@ You must check if the entity matches the type's criteria.
         entity_info = {
             'name': entity['name'],
             'summary': entity.get('summary', ''),
-            'assigned_type': entity.get('type', 'Entity'),
+            'assigned_type': entity.get('assigned_type', 'Entity'),
             'type_definition': entity.get('type_definition', ''),
         }
         entities_with_defs.append(entity_info)

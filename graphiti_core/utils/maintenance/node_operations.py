@@ -89,11 +89,15 @@ async def extract_nodes_reflexion(
     llm_client: LLMClient,
     episode: EpisodicNode,
     previous_episodes: list[EpisodicNode],
-    node_names: list[str],
+    extracted_entity_info: list[dict[str, str]],
     group_id: str | None = None,
     entity_types_context: list[dict] | None = None,
 ) -> MissedEntities:
     """Perform reflexion on extracted entities - both positive and negative.
+
+    Args:
+        extracted_entity_info: List of {"name": ..., "type": ...} dicts
+            so the LLM can validate current type assignments.
 
     Returns MissedEntities with:
     - missed_entities: entities that should have been extracted
@@ -104,7 +108,7 @@ async def extract_nodes_reflexion(
     context = {
         'episode_content': episode.content,
         'previous_episodes': [ep.content for ep in previous_episodes],
-        'extracted_entities': node_names,
+        'extracted_entities': extracted_entity_info,
         'entity_types': entity_types_context or [],
     }
 
@@ -412,11 +416,24 @@ async def extract_nodes(
         reflexion_iterations += 1
         if reflexion_iterations < MAX_REFLEXION_ITERATIONS:
             llm_start = time()
+            # Build entity info with current type for reflexion reclassify
+            def _resolve_type_name(entity):
+                type_id = getattr(entity, 'final_type_id', None)
+                if type_id is None:
+                    type_id = getattr(entity, 'entity_type_id', None)
+                if type_id is not None and entity_types_context and type_id < len(entity_types_context):
+                    return entity_types_context[type_id].get('entity_type_name', 'Entity')
+                return 'Entity'
+
+            entity_info = [
+                {'name': e.name, 'type': _resolve_type_name(e)}
+                for e in extracted_entities
+            ]
             reflexion_result = await extract_nodes_reflexion(
                 llm_client,
                 episode,
                 previous_episodes,
-                [entity.name for entity in extracted_entities],
+                entity_info,
                 episode.group_id,
                 entity_types_context,
             )

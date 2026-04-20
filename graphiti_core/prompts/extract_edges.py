@@ -157,6 +157,8 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
    - Why this relationship was extracted from the text
    - Why the chosen relation_type accurately represents the relationship
    - This forces careful consideration before extraction.
+9. Only extract relationships that are presented as **existing facts**. Do NOT extract relationships from hypothetical or conditional contexts (e.g., "if...depends on...", "assuming...uses...") — these relationships do not currently exist.
+10. Do NOT extract relationships that are explicitly **negated** in the text (e.g., "no longer part of", "is not a member of", "was removed from"). Negated statements describe relationships that do NOT currently exist.
 
 # DATETIME RULES
 
@@ -176,10 +178,15 @@ def reflexion(context: dict[str, Any]) -> list[Message]:
 1. **Positive reflexion**: Identify facts that SHOULD have been extracted but weren't
 2. **Negative reflexion**: Identify facts that are INCORRECT and should be removed or corrected
 
+Treat semantically equivalent paraphrases as correct extractions.
+Minor differences in articles, prepositions, or word order that preserve
+the core meaning should NOT be flagged in any category.
+
 A fact should be REMOVED if:
 - The relationship does not actually exist between the entities
 - The fact was hallucinated or misinterpreted from the text
-- The fact is redundant with another extracted fact
+- The fact is redundant with another extracted fact (two facts about the SAME entity pair
+  that express the SAME relationship with different wording are redundant; keep the more precise one)
 
 A fact should be CORRECTED if:
 - The relation_type is wrong (e.g., WORKS_AT instead of MANAGES)
@@ -208,13 +215,23 @@ Review the fact extraction quality and provide:
 
 2. **facts_to_remove**: Facts from EXTRACTED FACTS that should be REMOVED
    - List the exact fact text that should be removed
-   - Only include facts that are clearly incorrect or hallucinated
+   - Include facts that are clearly incorrect, hallucinated, or redundant with another extracted fact
 
 3. **facts_to_correct**: Facts with wrong relation_type or direction
    - original_fact: the exact fact text
    - issue: "wrong_relation_type" or "wrong_direction" or "nonexistent_relationship"
    - corrected_relation_type: the correct type (only for wrong_relation_type)
    - reason: why this correction is needed
+
+## Priority Rules
+- Match extracted facts to source text by **entity pair** (source, target), not by semantic similarity.
+  Two facts about the same entity pair = same relationship, possibly with wrong type or direction.
+- If an extracted fact has wrong relation_type or direction, put it in facts_to_correct ONLY.
+  Do NOT also add the corrected version to missing_facts.
+- If an extracted fact is completely wrong (hallucinated), put it in facts_to_remove ONLY.
+- Only use missing_facts for relationships that have NO corresponding extracted fact at all.
+- Each issue should appear in exactly ONE category.
+- Describe missing_facts in natural language, not SCREAMING_SNAKE_CASE.
 
 Return empty lists if the extraction quality is good.
 """
@@ -247,6 +264,7 @@ def extract_attributes(context: dict[str, Any]) -> list[Message]:
         Guidelines:
         1. Do not hallucinate entity property values if they cannot be found in the current context.
         2. Only use the provided MESSAGES and FACT to set attribute values.
+        3. REFERENCE TIME is provided only for resolving relative time expressions (e.g., "last month", "2 days ago"). Do NOT use it as a default value for any attribute when the MESSAGE contains no time information.
 
         <FACT>
         {context['fact']}
