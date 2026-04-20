@@ -94,7 +94,7 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
                                                     label: 'Entity',
                                                     stopwords: {stopwords_str}
                                                 }},
-                                                'name', 'summary', 'group_id'
+                                                'name', 'summary', 'synonyms', 'group_id'
                                                 )""",
                 f"""CALL db.idx.fulltext.createNodeIndex(
                                                 {{

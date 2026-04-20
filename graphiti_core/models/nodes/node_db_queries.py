@@ -223,6 +223,7 @@ def get_entity_node_save_bulk_query(
         'uuid', 'name', 'group_id', 'summary', 'created_at', 'labels',
         'reasoning', 'type_scores', 'type_confidence',
         'name_embedding', 'summary_embedding',  # These are handled separately
+        'synonyms',  # EasyOps: top-level field for BM25 + semantic search
     }
 
     match provider:
@@ -256,7 +257,8 @@ def get_entity_node_save_bulk_query(
                                 n.labels = node.labels,
                                 n.reasoning = node.reasoning,
                                 n.type_scores = node.type_scores,
-                                n.type_confidence = node.type_confidence{custom_set_clause}
+                                n.type_confidence = node.type_confidence,
+                                n.synonyms = node.synonyms{custom_set_clause}
                             WITH n, node
                             SET n.name_embedding = vecf32(node.name_embedding)
                             SET n.summary_embedding = CASE WHEN node.summary_embedding IS NOT NULL THEN vecf32(node.summary_embedding) ELSE NULL END

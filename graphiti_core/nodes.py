@@ -533,6 +533,9 @@ class EntityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
     summary_embedding: list[float] | None = Field(default=None, description='embedding of the summary for semantic search')
     summary: str = Field(description='regional summary of surrounding edges', default_factory=str)
+    synonyms: list[str] | None = Field(
+        default=None, description='Alternative names for the entity (indexed for BM25 + semantic search)'
+    )
     attributes: dict[str, Any] = Field(
         default={}, description='Additional attributes of the node. Dependent on node labels'
     )
@@ -554,6 +557,8 @@ class EntityNode(Node):
 
         解决语义稀释问题：英文 name + 中文 summary 拼接会导致相似度下降。
         分别存储两个向量，搜索时取 max(name_sim, summary_sim) 作为得分。
+
+        EasyOps 扩展：synonyms 拼入 summary_embedding 文本，使别名可被语义搜索命中。
         """
         start = time()
 
@@ -561,9 +566,12 @@ class EntityNode(Node):
         name_text = self.name.replace('\n', ' ')
         self.name_embedding = await embedder.create(input_data=[name_text])
 
-        # summary_embedding: 用 summary 生成（如果有 summary）
-        if self.summary:
-            summary_text = self.summary.replace('\n', ' ')
+        # summary_embedding: 用 summary + synonyms 生成（纳入别名语义）
+        summary_text = self.summary or ""
+        if self.synonyms:
+            summary_text += " " + " ".join(self.synonyms)
+        if summary_text.strip():
+            summary_text = summary_text.replace('\n', ' ')
             self.summary_embedding = await embedder.create(input_data=[summary_text])
         else:
             self.summary_embedding = None
@@ -615,6 +623,8 @@ class EntityNode(Node):
             # EasyOps: Save type classification scores
             'type_scores': json.dumps(self.type_scores) if self.type_scores else None,
             'type_confidence': self.type_confidence,
+            # EasyOps: Synonyms as top-level field for BM25 + semantic search
+            'synonyms': self.synonyms if self.synonyms else None,
         }
 
         if driver.provider == GraphProvider.KUZU:
@@ -626,6 +636,8 @@ class EntityNode(Node):
             )
         else:
             entity_data.update(self.attributes or {})
+            # EasyOps: Ensure top-level synonyms takes precedence over attributes spread
+            entity_data['synonyms'] = self.synonyms if self.synonyms else None
             labels = ':'.join(self.labels + ['Entity'])
 
             result = await driver.execute_query(
