@@ -35,16 +35,24 @@ class QwenRerankerConfig:
     api_key: str | None = None
     timeout: float = 30.0
     max_concurrent: int = 10
+    # API 风格：
+    #   'chat'   - 生成式部署，走 /v1/chat/completions + logprobs 逐文档打分
+    #   'rerank' - vLLM rerank 模式部署（如 belle llm-gateway），走 /v1/rerank 批量打分
+    api_style: str = 'chat'
+    # rerank 风格下单次请求的文档数上限（vLLM 默认单批上限）
+    batch_size: int = 100
 
 
 class QwenRerankerClient(CrossEncoderClient):
     """
     Qwen3 Reranker 客户端
 
-    使用 Qwen3-Reranker 模型对文档进行相关性排序。
-    通过 vLLM chat completions API 调用，使用 logprobs 获取 "yes" token 的概率作为相关性分数。
+    使用 Qwen3-Reranker 模型对文档进行相关性排序。支持两种 API 风格：
 
-    需要 vLLM 部署的 Qwen3-Reranker 模型。
+    - api_style='chat'：生成式部署。通过 vLLM chat completions API 调用，
+      使用 logprobs 获取 "yes" token 的概率作为相关性分数。
+    - api_style='rerank'：vLLM rerank 模式部署（--task rerank，如 belle llm-gateway）。
+      通过 /v1/rerank 端点批量打分，一次请求返回全部文档的 relevance_score。
     """
 
     # Qwen3-Reranker 的系统 prompt
@@ -148,9 +156,12 @@ class QwenRerankerClient(CrossEncoderClient):
         if not passages:
             return []
 
-        # 并发计算所有文档的分数
-        tasks = [self._score_single(query, passage) for passage in passages]
-        scores = await asyncio.gather(*tasks)
+        if self.config.api_style == 'rerank':
+            scores = await self._rank_via_rerank_endpoint(query, passages)
+        else:
+            # 并发计算所有文档的分数
+            tasks = [self._score_single(query, passage) for passage in passages]
+            scores = await asyncio.gather(*tasks)
 
         # 组合结果并排序
         results = list(zip(passages, scores, strict=True))
@@ -159,6 +170,41 @@ class QwenRerankerClient(CrossEncoderClient):
         logger.debug(f'Reranked {len(passages)} passages for query: {query[:50]}...')
 
         return results
+
+    async def _rank_via_rerank_endpoint(
+        self, query: str, passages: list[str]
+    ) -> list[float]:
+        """通过 /v1/rerank 端点批量打分，按 batch_size 分批请求"""
+        scores: list[float] = []
+        batch_size = max(1, self.config.batch_size)
+
+        async with self._semaphore:
+            for start in range(0, len(passages), batch_size):
+                batch = passages[start : start + batch_size]
+                try:
+                    response = await self._client.post(
+                        f'{self.config.base_url}/v1/rerank',
+                        json={
+                            'model': self.config.model,
+                            'query': query,
+                            'documents': batch,
+                        },
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+
+                    # results 按 index 对应输入 documents，还原为原始顺序
+                    batch_scores = [0.5] * len(batch)
+                    for item in data.get('results', []):
+                        index = item.get('index')
+                        if index is not None and 0 <= index < len(batch):
+                            batch_scores[index] = item.get('relevance_score', 0.5)
+                    scores.extend(batch_scores)
+                except Exception as e:
+                    logger.error(f'Reranker scoring failed: {e}')
+                    scores.extend([0.5] * len(batch))
+
+        return scores
 
     async def close(self):
         """关闭 HTTP 客户端"""
