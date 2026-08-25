@@ -33,7 +33,7 @@ def is_telemetry_enabled() -> bool:
         return False
 
     # Check environment variable (default: enabled)
-    env_value = os.environ.get(TELEMETRY_ENV_VAR, 'true').lower()
+    env_value = os.environ.get(TELEMETRY_ENV_VAR, 'false').lower()
     return env_value in ('true', '1', 'yes', 'on')
 
 
