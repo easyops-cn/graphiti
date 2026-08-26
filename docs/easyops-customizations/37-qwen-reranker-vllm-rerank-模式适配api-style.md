@@ -5,7 +5,7 @@
 `QwenRerankerClient` 原实现只支持**生成式部署**的 Qwen3-Reranker：通过
 `/v1/chat/completions` + `logprobs` 提取 "yes" token 概率作为相关性分数。
 
-客户环境（belle llm-gateway）的 `qwen3-reranker-0.6b` 是按 **vLLM rerank 模式**
+某些网关环境的 `qwen3-reranker-0.6b` 是按 **vLLM rerank 模式**
 （`--task rerank`）部署的：
 
 - `/v1/chat/completions` 请求返回 HTTP 200 但 body 为 `{"object": "error", ...}`，
@@ -34,7 +34,7 @@
 
 ```bash
 QWEN_RERANKER_ENABLED=true
-QWEN_RERANKER_BASE_URL=http://llm-gateway.prd.bjm6v.belle.lan   # 注意不带 /v1
+QWEN_RERANKER_BASE_URL=http://<your-gateway-host>   # 注意不带 /v1
 QWEN_RERANKER_MODEL=qwen3-reranker-0.6b
 QWEN_RERANKER_API_KEY=sk-xxx
 QWEN_RERANKER_API_STYLE=rerank   # chat（默认）= 生成式部署；rerank = vLLM rerank 模式
@@ -45,7 +45,7 @@ QWEN_RERANKER_BATCH_SIZE=100     # 可选，默认 100
 
 - 单元测试：`tests/unit/test_qwen_reranker_client.py`（chat 与 rerank 两种风格的
   URL/payload/排序/错误兜底/分批行为）
-- 真实网关实测：belle llm-gateway 上 `qwen3-embedding-0.6b`（/v1/embeddings）与
+- 真实网关实测： `qwen3-embedding-0.6b`（/v1/embeddings）与
   `qwen3-reranker-0.6b`（/v1/rerank）均返回正常结果（2026-08-19）
 
 ## 升级注意事项

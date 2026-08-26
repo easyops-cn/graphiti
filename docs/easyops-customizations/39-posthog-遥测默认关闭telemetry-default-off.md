@@ -5,7 +5,7 @@
 Graphiti 上游默认开启 PostHog 遥测（`GRAPHITI_TELEMETRY_ENABLED` 默认 `true`），
 每次图操作后向 `https://us.i.posthog.com` 上报事件。
 
-企业内网环境（如百丽）不可达外网 PostHog：
+内网隔离环境不可达外网 PostHog：
 - 每次 `capture` 触发的上报在后台 consumer 线程排队/重试
 - cProfile 采样显示 bulk 导入中 `posthog.consumer.upload` 占比显著
   （117s 的 profile 里 posthog upload 累计 ~110s，虽多数在后台线程，

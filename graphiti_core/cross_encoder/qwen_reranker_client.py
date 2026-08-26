@@ -37,7 +37,7 @@ class QwenRerankerConfig:
     max_concurrent: int = 10
     # API 风格：
     #   'chat'   - 生成式部署，走 /v1/chat/completions + logprobs 逐文档打分
-    #   'rerank' - vLLM rerank 模式部署（如 belle llm-gateway），走 /v1/rerank 批量打分
+    #   'rerank' - vLLM rerank 模式部署（如 vLLM --task rerank 部署），走 /v1/rerank 批量打分
     api_style: str = 'chat'
     # rerank 风格下单次请求的文档数上限（vLLM 默认单批上限）
     batch_size: int = 100
@@ -51,7 +51,7 @@ class QwenRerankerClient(CrossEncoderClient):
 
     - api_style='chat'：生成式部署。通过 vLLM chat completions API 调用，
       使用 logprobs 获取 "yes" token 的概率作为相关性分数。
-    - api_style='rerank'：vLLM rerank 模式部署（--task rerank，如 belle llm-gateway）。
+    - api_style='rerank'：vLLM rerank 模式部署（--task rerank，如 vLLM --task rerank 部署）。
       通过 /v1/rerank 端点批量打分，一次请求返回全部文档的 relevance_score。
     """
 
