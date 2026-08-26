@@ -779,6 +779,17 @@ async def _resolve_with_llm(
     if not state.unresolved_indices:
         return
 
+    # EasyOps optimization: zero-candidate short-circuit.
+    # When the candidate index has no existing nodes at all, there is nothing to
+    # deduplicate against — every extracted node is new by definition. Calling
+    # the LLM here only asks it to confirm "no duplicates" at significant latency
+    # cost (observed 50s+ on gateways slow at long-prompt structured output).
+    if not indexes.existing_nodes:
+        logger.debug(
+            'Skipping LLM dedup: no existing candidate nodes to compare against'
+        )
+        return
+
     entity_types_dict: dict[str, type[BaseModel]] = entity_types if entity_types is not None else {}
 
     llm_extracted_nodes = [extracted_nodes[i] for i in state.unresolved_indices]
@@ -986,8 +997,14 @@ async def resolve_extracted_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
     existing_nodes_override: list[EntityNode] | None = None,
+    skip_llm_fallback: bool = False,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
-    """Search for existing nodes, resolve deterministic matches, then escalate holdouts to the LLM dedupe prompt."""
+    """Search for existing nodes, resolve deterministic matches, then escalate holdouts to the LLM dedupe prompt.
+
+    skip_llm_fallback: 跳过 LLM 兜底判定，未匹配的实体一律按新实体处理。
+    适用于调用方显式指定实体名的场景（如 Triplet API）——名称语义明确，
+    不存在"LLM 抽取的名字可能有歧义"的问题，LLM 兜底只增加延迟。
+    """
     llm_client = clients.llm_client
     driver = clients.driver
     existing_nodes = await _collect_candidate_nodes(
@@ -1006,15 +1023,16 @@ async def resolve_extracted_nodes(
 
     _resolve_with_similarity(extracted_nodes, indexes, state)
 
-    await _resolve_with_llm(
-        llm_client,
-        extracted_nodes,
-        indexes,
-        state,
-        episode,
-        previous_episodes,
-        entity_types,
-    )
+    if not skip_llm_fallback:
+        await _resolve_with_llm(
+            llm_client,
+            extracted_nodes,
+            indexes,
+            state,
+            episode,
+            previous_episodes,
+            entity_types,
+        )
 
     for idx, node in enumerate(extracted_nodes):
         if state.resolved_nodes[idx] is None:

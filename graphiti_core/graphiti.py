@@ -1428,9 +1428,13 @@ class Graphiti:
         if edge.fact_embedding is None:
             await edge.generate_embedding(self.embedder)
 
+        # Triplet API 场景：实体名由调用方显式指定，语义明确。
+        # 确定性匹配（精确名/模糊）已覆盖重复判定，LLM 兜底只增加延迟
+        # （慢网关上 50s+），跳过。
         nodes, uuid_map, _ = await resolve_extracted_nodes(
             self.clients,
             [source_node, target_node],
+            skip_llm_fallback=True,
         )
 
         updated_edge = resolve_edge_pointers([edge], uuid_map)[0]
