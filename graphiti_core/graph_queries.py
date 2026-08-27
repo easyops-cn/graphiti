@@ -104,6 +104,14 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
                                                 'name', 'group_id'
                                                 )""",
                 """CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id)""",
+                # EasyOps perf: 边向量索引（edge cosine KNN；无此索引时全表扫描
+                # 3.6 万边 ~1.5s，有索引 ~10ms）。存量 group 需手动补建：
+                # CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)
+                #   OPTIONS {dimension: 1024, similarityFunction: 'cosine'}
+                # 节点向量索引同理（Entity.name_embedding / summary_embedding）
+                """CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding) OPTIONS {dimension: 1024, similarityFunction: 'cosine'}""",
+                """CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) OPTIONS {dimension: 1024, similarityFunction: 'cosine'}""",
+                """CREATE VECTOR INDEX FOR (n:Entity) ON (n.summary_embedding) OPTIONS {dimension: 1024, similarityFunction: 'cosine'}""",
             ],
         )
 

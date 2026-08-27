@@ -404,6 +404,46 @@ async def edge_similarity_search(
         else:
             return []
     else:
+        # EasyOps perf: FalkorDB 走向量索引 KNN（RELATES_TO.fact_embedding 建有
+        # VECTOR 索引），替代原全表 cosine 扫描（3.6 万边 1.5s -> ~10ms）。
+        # 无 source/target 过滤时 KNN 一次取数再按 group/min_score 后置过滤；
+        # 带 source/target 锚定时退回锚定 MATCH + 索引点查。
+        if driver.provider == GraphProvider.FALKORDB and source_node_uuid is None and target_node_uuid is None:
+            knn_k = max(limit * 4, 100)  # 超采样补偿 group 过滤
+            knn_query = """
+                CALL db.idx.vector.queryRelationships(
+                    'RELATES_TO', 'fact_embedding', $knn_k, vecf32($search_vector)
+                )
+                YIELD relationship AS e, score
+            """
+            knn_filters = []
+            knn_params: dict = {'knn_k': knn_k, 'search_vector': search_vector}
+            if group_ids is not None:
+                knn_filters.append('e.group_id IN $group_ids')
+                knn_params['group_ids'] = group_ids
+            extra_fq, extra_fp = edge_search_filter_query_constructor(
+                search_filter, driver.provider
+            )
+            knn_filters.extend(extra_fq)
+            knn_params.update(extra_fp)
+            where_clause = (' WHERE ' + ' AND '.join(knn_filters)) if knn_filters else ''
+            knn_query += (
+                where_clause
+                + ' WITH e, score WHERE score > $min_score'
+                + ' RETURN '
+                + get_entity_edge_return_query(driver.provider)
+                + ' ORDER BY score DESC LIMIT $limit'
+            )
+            knn_params['min_score'] = min_score
+            knn_params['limit'] = limit
+            records, _, _ = await driver.execute_query(
+                knn_query, routing_='r', **knn_params
+            )
+            edges = [
+                get_entity_edge_from_record(r, driver.provider) for r in records
+            ]
+            return edges
+
         query = (
             match_query
             + filter_query
