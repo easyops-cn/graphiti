@@ -430,6 +430,10 @@ async def edge_similarity_search(
             knn_query += (
                 where_clause
                 + ' WITH e, score WHERE score > $min_score'
+                # get_entity_edge_return_query 引用 n/m 变量（source/target uuid），
+                # KNN 只 YIELD 边，需 MATCH 两端节点补绑定（uuid 锚定走索引）
+                + ' MATCH (n:Entity {uuid: e.source_uuid})'
+                + ' MATCH (m:Entity {uuid: e.target_uuid})'
                 + ' RETURN '
                 + get_entity_edge_return_query(driver.provider)
                 + ' ORDER BY score DESC LIMIT $limit'
