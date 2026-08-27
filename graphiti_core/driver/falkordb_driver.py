@@ -474,7 +474,11 @@ class FalkorDriver(GraphDriver):
 
         # EasyOps: identifier-shaped queries use AND (space join), others OR
         joiner = ' ' if self._is_identifier_query(filtered_words) else ' | '
-        sanitized_query = joiner.join(filtered_words)
+        # EasyOps: 去重保序——重复 token（如 IP 10.44.44.44 → 10/44/44/44）
+        # 在 AND 语义下会被解析为要求词频，导致含该 token 的文档反而不命中
+        seen: set[str] = set()
+        deduped = [w for w in filtered_words if not (w in seen or seen.add(w))]
+        sanitized_query = joiner.join(deduped)
 
         # If the query is too long return no query
         if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
