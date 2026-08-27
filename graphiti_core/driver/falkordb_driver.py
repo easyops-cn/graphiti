@@ -453,40 +453,58 @@ class FalkorDriver(GraphDriver):
         """
         Build a fulltext query string for FalkorDB using RedisSearch syntax.
         FalkorDB uses RedisSearch-like syntax where:
-        - Field queries use @ prefix: @field:value
-        - Multiple values for same field: (@field:value1|value2)
         - Text search doesn't need @ prefix for content fields
-        - AND is implicit with space: (@group_id:value) (text)
-        - OR uses pipe within parentheses: (@group_id:value1|value2)
+        - AND is implicit with space
+        - OR uses pipe within parentheses
 
-        Note: Underscores are NOT separators in RediSearch, so group_ids with underscores
-        don't need escaping. See: https://redis.io/docs/latest/develop/ai/search-and-query/advanced-concepts/escaping/
+        EasyOps fixes (see docs/easyops-customizations/40):
+        - group_id filter is NOT embedded in the fulltext string: UUID group ids
+          contain hyphens which the tokenizer splits, making exact @group_id
+          matching always empty (BM25 silently returned 0 rows). Tenant filtering
+          is applied downstream via Cypher WHERE n.group_id IN $group_ids.
+        - Identifier-shaped queries (IPs, >=2 bare-number tokens) join tokens
+          with AND instead of OR: OR over numeric fragments matches thousands
+          of unrelated entities and buries the real hit.
         """
-        if group_ids is None or len(group_ids) == 0:
-            group_filter = ''
-        else:
-            group_values = '|'.join(group_ids)
-            group_filter = f'(@group_id:{group_values})'
-
         sanitized_query = self.sanitize(query)
 
         # Remove stopwords from the sanitized query
         query_words = sanitized_query.split()
         filtered_words = [word for word in query_words if word.lower() not in STOPWORDS]
-        sanitized_query = ' | '.join(filtered_words)
+
+        # EasyOps: identifier-shaped queries use AND (space join), others OR
+        joiner = ' ' if self._is_identifier_query(filtered_words) else ' | '
+        sanitized_query = joiner.join(filtered_words)
 
         # If the query is too long return no query
         if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
             return ''
 
-        # Handle empty search query - only use group filter (avoid empty "()" which causes syntax error)
+        # Handle empty search query
         if not sanitized_query.strip():
-            # Return just the group filter, or '*' if no filter
-            return group_filter if group_filter else '*'
+            return '*'
 
-        full_query = group_filter + ' (' + sanitized_query + ')'
+        return '(' + sanitized_query + ')'
 
-        return full_query
+    @staticmethod
+    def _is_identifier_query(words: list[str]) -> bool:
+        """标识符特征判定：任一 token 是 IP 形态，或 >=2 个纯数字 token。
+
+        IP 查询（10.252.12.40 被 sanitize 拆成 4 段）与工单号/版本号等多数字
+        查询在 OR 语义下是噪声海洋；AND 要求全部 token 命中，实测可将正确
+        目标排到首位。
+        """
+        import re
+
+        number_tokens = 0
+        for w in words:
+            if re.fullmatch(r'\d+', w):
+                number_tokens += 1
+                continue
+            # IP 片段形态（未被拆完的残留，如 10.252）
+            if re.search(r'\d+\.\d+', w):
+                return True
+        return number_tokens >= 2
 
     async def load_episode_content(
         self, episode: 'EpisodicNode', max_length: int | None = None
