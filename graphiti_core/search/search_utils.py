@@ -185,9 +185,14 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
+    # EasyOps perf fix: anchor the MATCH on indexed node uuids.
+    # The original pattern MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    # does a full RELATES_TO scan per yielded edge (92 edges x 36k rels = 75s on
+    # prod data). Anchoring both endpoints via the relationship's source/target
+    # uuid fields uses the Entity.uuid range index: same query in 3.6ms.
     match_query = """
     YIELD relationship AS rel, score
-    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    MATCH (n:Entity {uuid: rel.source_uuid})-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity {uuid: rel.target_uuid})
     """
     if driver.provider == GraphProvider.KUZU:
         match_query = """
