@@ -513,7 +513,10 @@ async def node_search(
         # EasyOps: 使用 name + summary 进行 cross_encoder reranking
         # 只用 name 会导致 reranker 无法判断相关性（例如问 "who is the father of X"，只有 summary 包含答案）
         # summary 为空的节点不参与 rerank：reranker 对裸名文本的判别不可靠，
-        # 会让无 summary 的节点被错误顶高/压低；这些节点保留 RRF 检索顺序直接排在 rerank 结果之后
+        # 会让无 summary 的节点被错误顶高/压低。
+        # 但无 summary 节点不能固定排尾部：BM25 精确命中（如搜完整域名/IP，AND 查询
+        # 只召回它自己）时会被 cosine 召回的有 summary 实体全部挤出结果。
+        # 因此无 summary 节点按 RRF 名次与 rerank 结果归并穿插，而不是追加在末尾。
         text_to_uuid_map = {}
         nodes_without_summary: list[str] = []
         for node in node_uuid_map.values():
@@ -529,11 +532,43 @@ async def node_search(
             if score >= reranker_min_score
         ]
         node_scores = [score for _, score in reranked_texts if score >= reranker_min_score]
-        # 无 summary 节点追加在 rerank 结果之后（保持检索顺序），不再送入 reranker
-        reranked_uuids.extend(
-            uuid for uuid in nodes_without_summary if uuid not in set(reranked_uuids)
-        )
-        node_scores.extend(0.0 for _ in range(len(reranked_uuids) - len(node_scores)))
+        if nodes_without_summary:
+            # 无 summary 节点单独跑 RRF 得到名次，按比例穿插进 rerank 结果
+            # （而非固定尾部）：RRF 第 1 名（BM25 精确命中，如搜完整域名）
+            # 应出现在结果前部，不能被 cosine 召回的有 summary 实体全部挤出。
+            rrf_uuids, _ = rrf(
+                [
+                    [uuid for uuid in result if uuid in set(nodes_without_summary)]
+                    for result in search_result_uuids
+                ],
+                min_score=0,
+            )
+            if rrf_uuids:
+                # 归并策略：RRF 榜首固定插到第 2 位（BM25+cosine 双路共识最高的
+                # 无 summary 节点，如 query==name 的精确域名/IP 匹配；第 1 位留给
+                # reranker 最有把握的结果），其余按 step 比例穿插，避免被挤出 limit。
+                rest = rrf_uuids[1:]
+                merged: list[tuple[str, float]] = list(
+                    zip(reranked_uuids, node_scores)
+                )
+                if rest:
+                    step = max(1, len(merged) // len(rest))
+                    si = iter(rest)
+                    interleaved: list[tuple[str, float]] = []
+                    for i, item in enumerate(merged):
+                        interleaved.append(item)
+                        if (i + 1) % step == 0:
+                            try:
+                                interleaved.append((next(si), 0.0))
+                            except StopIteration:
+                                pass
+                    for u in si:
+                        interleaved.append((u, 0.0))
+                    merged = interleaved
+                # RRF 榜首插到位置 1（第 2 名）
+                merged.insert(1, (rrf_uuids[0], 0.0))
+                reranked_uuids = [u for u, _ in merged]
+                node_scores = [s for _, s in merged]
     elif config.reranker == NodeReranker.episode_mentions:
         reranked_uuids, node_scores = await episode_mentions_reranker(
             driver, search_result_uuids, min_score=reranker_min_score
