@@ -512,13 +512,15 @@ async def node_search(
     elif config.reranker == NodeReranker.cross_encoder:
         # EasyOps: 使用 name + summary 进行 cross_encoder reranking
         # 只用 name 会导致 reranker 无法判断相关性（例如问 "who is the father of X"，只有 summary 包含答案）
+        # summary 为空的节点不参与 rerank：reranker 对裸名文本的判别不可靠，
+        # 会让无 summary 的节点被错误顶高/压低；这些节点保留 RRF 检索顺序直接排在 rerank 结果之后
         text_to_uuid_map = {}
+        nodes_without_summary: list[str] = []
         for node in node_uuid_map.values():
             if node.summary:
-                text = f"{node.name}: {node.summary}"
+                text_to_uuid_map[f"{node.name}: {node.summary}"] = node.uuid
             else:
-                text = node.name
-            text_to_uuid_map[text] = node.uuid
+                nodes_without_summary.append(node.uuid)
 
         reranked_texts = await cross_encoder.rank(query, list(text_to_uuid_map.keys()))
         reranked_uuids = [
@@ -527,6 +529,11 @@ async def node_search(
             if score >= reranker_min_score
         ]
         node_scores = [score for _, score in reranked_texts if score >= reranker_min_score]
+        # 无 summary 节点追加在 rerank 结果之后（保持检索顺序），不再送入 reranker
+        reranked_uuids.extend(
+            uuid for uuid in nodes_without_summary if uuid not in set(reranked_uuids)
+        )
+        node_scores.extend(0.0 for _ in range(len(reranked_uuids) - len(node_scores)))
     elif config.reranker == NodeReranker.episode_mentions:
         reranked_uuids, node_scores = await episode_mentions_reranker(
             driver, search_result_uuids, min_score=reranker_min_score

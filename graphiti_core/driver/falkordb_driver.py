@@ -473,7 +473,7 @@ class FalkorDriver(GraphDriver):
         filtered_words = [word for word in query_words if word.lower() not in STOPWORDS]
 
         # EasyOps: identifier-shaped queries use AND (space join), others OR
-        joiner = ' ' if self._is_identifier_query(filtered_words) else ' | '
+        joiner = ' ' if self._is_identifier_query(query, filtered_words) else ' | '
         # EasyOps: 去重保序——重复 token（如 IP 10.44.44.44 → 10/44/44/44）
         # 在 AND 语义下会被解析为要求词频，导致含该 token 的文档反而不命中
         seen: set[str] = set()
@@ -491,22 +491,31 @@ class FalkorDriver(GraphDriver):
         return '(' + sanitized_query + ')'
 
     @staticmethod
-    def _is_identifier_query(words: list[str]) -> bool:
-        """标识符特征判定：任一 token 是 IP 形态，或 >=2 个纯数字 token。
+    def _is_identifier_query(query: str, words: list[str]) -> bool:
+        """标识符特征判定（原始 query 形态 + sanitize 后 token 双重判定）。
 
-        IP 查询（10.252.12.40 被 sanitize 拆成 4 段）与工单号/版本号等多数字
-        查询在 OR 语义下是噪声海洋；AND 要求全部 token 命中，实测可将正确
-        目标排到首位。
+        - 原始 query 含点分多段（IP/域名，如 10.252.12.40、retail-brs-dev.belle.cn）
+        - 原始 query 含 >=3 个连字符段（长 hostname，如 szsjhl-openstack-compute-test-node-01）
+        - sanitize 后 >=2 个纯数字 token（工单号/版本号等）
+        以上查询在 OR 语义下是噪声海洋；AND 要求全部 token 命中，实测可将正确
+        目标排到首位。自然语言单词（how/fix/service）不受影响。
         """
         import re
 
+        # 原始形态判定：点分 >=3 段（IP 或域名）
+        segments = [s for s in re.split(r'[./]', query) if s.strip()]
+        if len(segments) >= 3 and not any(' ' in s.strip() for s in segments[:3]):
+            return True
+        # 原始形态判定：长 hostname（>=3 个连字符段）
+        if query.count('-') >= 3:
+            return True
+        # token 判定：>=2 个纯数字
         number_tokens = 0
         for w in words:
             if re.fullmatch(r'\d+', w):
                 number_tokens += 1
-                continue
             # IP 片段形态（未被拆完的残留，如 10.252）
-            if re.search(r'\d+\.\d+', w):
+            elif re.search(r'\d+\.\d+', w):
                 return True
         return number_tokens >= 2
 

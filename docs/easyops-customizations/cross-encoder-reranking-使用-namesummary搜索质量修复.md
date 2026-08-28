@@ -25,13 +25,15 @@
 elif config.reranker == NodeReranker.cross_encoder:
     # EasyOps: 使用 name + summary 进行 cross_encoder reranking
     # 只用 name 会导致 reranker 无法判断相关性（例如问 "who is the father of X"，只有 summary 包含答案）
+    # summary 为空的节点不参与 rerank：reranker 对裸名文本的判别不可靠，
+    # 会让无 summary 的节点被错误顶高/压低；这些节点保留 RRF 检索顺序直接排在 rerank 结果之后
     text_to_uuid_map = {}
+    nodes_without_summary: list[str] = []
     for node in node_uuid_map.values():
         if node.summary:
-            text = f"{node.name}: {node.summary}"
+            text_to_uuid_map[f"{node.name}: {node.summary}"] = node.uuid
         else:
-            text = node.name
-        text_to_uuid_map[text] = node.uuid
+            nodes_without_summary.append(node.uuid)
 
     reranked_texts = await cross_encoder.rank(query, list(text_to_uuid_map.keys()))
     reranked_uuids = [
@@ -40,7 +42,20 @@ elif config.reranker == NodeReranker.cross_encoder:
         if score >= reranker_min_score
     ]
     node_scores = [score for _, score in reranked_texts if score >= reranker_min_score]
+    # 无 summary 节点追加在 rerank 结果之后（保持检索顺序），不再送入 reranker
+    reranked_uuids.extend(
+        uuid for uuid in nodes_without_summary if uuid not in set(reranked_uuids)
+    )
+    node_scores.extend(0.0 for _ in range(len(reranked_uuids) - len(node_scores)))
 ```
+
+### 空 summary 节点的处理（2026-08 增补）
+
+早期版本对 summary 为空的节点传裸 `node.name` 给 reranker。实测（百丽生产数据，
+21000 实体）发现裸名文本会让 reranker 乱判：无 summary 的域名/DB 实体被错误顶高，
+而 reranker 对 `name: 空白` 这种格式的打分也极不稳定。改为**不参与 rerank**：
+rerank 只覆盖有 summary 的节点，无 summary 节点按 RRF 检索顺序追加在 rerank 结果之后
+（score 记 0.0，仅作占位不参与过滤判断）。
 
 ## 效果
 

@@ -17,6 +17,7 @@ limitations under the License.
 import asyncio
 import logging
 import math
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -43,6 +44,46 @@ class QwenRerankerConfig:
     batch_size: int = 100
 
 
+class CircuitBreaker:
+    """reranker 熔断器：连续失败达阈值后跳过请求（省配额、不打爆网关），
+    熔断时长到后半开探测，成功恢复。
+
+    线程安全说明：asyncio 单线程事件循环下使用，无锁。
+    """
+
+    def __init__(self, failure_threshold: int = 3, reset_timeout_s: float = 600):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout_s = reset_timeout_s
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+        self._half_open = False
+
+    def allow_request(self) -> bool:
+        """是否放行 reranker 请求。闭合/半开放行，打开期间拒绝。"""
+        if self._opened_at is None:
+            return True
+        # 熔断时长到 → 半开（放一个探测请求）
+        if time.monotonic() - self._opened_at >= self.reset_timeout_s:
+            self._half_open = True
+            return True
+        return False
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._opened_at = None
+        self._half_open = False
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.failure_threshold:
+            self._opened_at = time.monotonic()
+            self._half_open = False
+
+    @property
+    def is_open(self) -> bool:
+        return self._opened_at is not None and not self.allow_request()
+
+
 class QwenRerankerClient(CrossEncoderClient):
     """
     Qwen3 Reranker 客户端
@@ -65,6 +106,13 @@ class QwenRerankerClient(CrossEncoderClient):
             headers['Authorization'] = f'Bearer {self.config.api_key}'
         self._client = httpx.AsyncClient(timeout=self.config.timeout, headers=headers)
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
+        # 熔断器：连续失败（如网关 429/403）后跳过 reranker 请求，
+        # 避免每次搜索打出几十个注定失败的请求
+        self._breaker = CircuitBreaker(
+            failure_threshold=3, reset_timeout_s=600
+        )
+        # 最近一次 rank 是否降级（熔断跳过 / 全部失败）
+        self.last_rank_degraded: bool = False
 
     async def _score_single(self, query: str, document: str) -> float:
         """计算单个文档的相关性分数"""
@@ -93,6 +141,7 @@ class QwenRerankerClient(CrossEncoderClient):
                     },
                 )
                 response.raise_for_status()
+                self._breaker.record_success()
                 data = response.json()
 
                 # 从 logprobs 中提取分数
@@ -139,7 +188,21 @@ class QwenRerankerClient(CrossEncoderClient):
                 return 0.5  # 无法判断时返回中间值
 
             except Exception as e:
-                logger.error(f'Reranker scoring failed: {e}')
+                if self._breaker.is_open:
+                    # 已熔断：限频记录（每次搜索最多一条，防日志风暴）
+                    logger.warning(
+                        'Reranker circuit OPEN, skipping rerank '
+                        f'({self._breaker._consecutive_failures} consecutive failures). '
+                        'Results are RRF-ordered only.'
+                    )
+                else:
+                    logger.error(f'Reranker scoring failed: {e}')
+                    self._breaker.record_failure()
+                    if self._breaker.is_open:
+                        logger.warning(
+                            'Reranker circuit OPENED after consecutive failures; '
+                            f'will retry in {self._breaker.reset_timeout_s}s'
+                        )
                 return 0.5  # 出错时返回中间值
 
     async def rank(self, query: str, passages: list[str]) -> list[tuple[str, float]]:
@@ -155,6 +218,16 @@ class QwenRerankerClient(CrossEncoderClient):
         """
         if not passages:
             return []
+
+        # 熔断打开：跳过全部 reranker 请求，直接中性分（RRF 兜底排序）
+        if not self._breaker.allow_request():
+            self.last_rank_degraded = True
+            logger.warning(
+                'Reranker circuit OPEN, skipping rerank for '
+                f'{len(passages)} passages (RRF-ordered only)'
+            )
+            return list(zip(passages, [0.5] * len(passages), strict=True))
+        self.last_rank_degraded = False
 
         if self.config.api_style == 'rerank':
             scores = await self._rank_via_rerank_endpoint(query, passages)
