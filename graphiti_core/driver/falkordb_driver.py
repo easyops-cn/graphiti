@@ -17,6 +17,7 @@ limitations under the License.
 import asyncio
 import datetime
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 # Import storage classes
@@ -472,6 +473,17 @@ class FalkorDriver(GraphDriver):
         query_words = sanitized_query.split()
         filtered_words = [word for word in query_words if word.lower() not in STOPWORDS]
 
+        # EasyOps: 混合 query 的 IP 子串识别（真实 Agent 流量场景）
+        # 「主机 10.10.217.245」这类中文+IP 混合 query：现有判定对它也返回 True
+        # （点分≥3段）走整串 AND，中文词（主机/信息/K8s节点）会被要求全部命中
+        # 而目标实体的 name/summary 里没有这些词 → 0 命中。
+        # 正确形态：IP 段 AND 必选 + 文字词 OR 附加：'(10 217 245 主机 | K8s节点)'。
+        # 仅当 query 含 IP 且还有其他非 IP 文字时走该分支（纯 IP query 维持整串 AND）。
+        ip_groups = self._extract_ip_groups(query)
+        has_non_ip_words = any(w for w in filtered_words if not w.isdigit())
+        if ip_groups and has_non_ip_words:
+            return self._build_mixed_ip_query(ip_groups, filtered_words)
+
         # EasyOps: identifier-shaped queries use AND (space join), others OR
         joiner = ' ' if self._is_identifier_query(query, filtered_words) else ' | '
         # EasyOps: 去重保序——重复 token（如 IP 10.44.44.44 → 10/44/44/44）
@@ -489,6 +501,43 @@ class FalkorDriver(GraphDriver):
             return '*'
 
         return '(' + sanitized_query + ')'
+
+    IP_PATTERN = re.compile(r'\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b')
+
+    @classmethod
+    def _extract_ip_groups(cls, query: str) -> list[list[str]]:
+        """从原始 query 抽取 IP 子串，返回去重后的段列表（每组一个 IP）。
+
+        '主机 10.10.217.245' → [['10', '217', '245']]（10 重复段去重保序）
+        无 IP 返回 []。
+        """
+        groups = []
+        for m in cls.IP_PATTERN.finditer(query):
+            octets = m.groups()
+            seen: set[str] = set()
+            deduped = [o for o in octets if not (o in seen or seen.add(o))]
+            if deduped not in groups:
+                groups.append(deduped)
+        return groups
+
+    @staticmethod
+    def _build_mixed_ip_query(ip_groups: list[list[str]], words: list[str]) -> str:
+        """混合 query 构造：IP 段 AND 必选，文字词作为可选 OR 组并列。
+
+        单 IP：'((10 217 245) | 主机 | K8s节点)'
+        - IP 段组是高置信约束，命中它的目标排最高（唯一且分数高）
+        - 文字词 OR 并列做召回兜底：即便 IP 段因数据缺失不命中，
+          含'主机'等的实体仍可被召回（不影响 IP 精确目标的排序）
+        多 IP：'((10 217 245) | (10 42 1) | 文字词...)'
+        """
+        def dedup_keep_order(items: list[str]) -> list[str]:
+            seen: set[str] = set()
+            return [w for w in items if not (w in seen or seen.add(w))]
+
+        all_ip_tokens = {t for g in ip_groups for t in g}
+        word_terms = [w for w in dedup_keep_order(words) if w not in all_ip_tokens]
+        or_parts = ['(' + ' '.join(g) + ')' for g in ip_groups] + word_terms
+        return '(' + ' | '.join(or_parts) + ')'
 
     @staticmethod
     def _is_identifier_query(query: str, words: list[str]) -> bool:
