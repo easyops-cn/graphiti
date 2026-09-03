@@ -49,13 +49,20 @@ elif config.reranker == NodeReranker.cross_encoder:
     node_scores.extend(0.0 for _ in range(len(reranked_uuids) - len(node_scores)))
 ```
 
-### 空 summary 节点的处理（2026-08 增补）
+### 空 summary 节点的处理（2026-09 复核：保持裸名送 rerank）
 
-早期版本对 summary 为空的节点传裸 `node.name` 给 reranker。实测（百丽生产数据，
-21000 实体）发现裸名文本会让 reranker 乱判：无 summary 的域名/DB 实体被错误顶高，
-而 reranker 对 `name: 空白` 这种格式的打分也极不稳定。改为**不参与 rerank**：
-rerank 只覆盖有 summary 的节点，无 summary 节点按 RRF 检索顺序追加在 rerank 结果之后
-（score 记 0.0，仅作占位不参与过滤判断）。
+中间版本（2026-08）曾改为"summary 为空的节点不参与 rerank，追加在结果尾部"。
+实测副作用：无 summary 的**目标本体**（域名实体，客户数据只有名字没有业务属性）
+被 cosine 召回的有 summary 候选淹没，[:limit] 截断后完全丢失——域名精确搜索
+3 例回退（`www.topsports.com.cn` 搜出一堆无关 pod）。
+
+复核打分行为（2026-09，qwen3-reranker-0.6b via one.elevo.vip）：
+- query == name 时稳定输出 0.99+（3 次复测波动 <0.1%），"裸名乱打分"不成立
+- 真正的短板是细分度：目标 0.98 vs 词面重叠竞争者 0.986，分差决定排名
+
+结论：维持裸名送 rerank（name 即 query 的实体天然高分）。细分度问题不在
+reranker 解决，由 elevo 侧锚定层（identifier_pinning）用确定性规则处理：
+身份属性精确等值 → 钉顶。
 
 ## 效果
 
