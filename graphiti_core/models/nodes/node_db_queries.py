@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
@@ -160,7 +161,59 @@ EPISODIC_NODE_RETURN_NEPTUNE = """
 """
 
 
-def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: bool = False) -> str:
+def get_entity_node_save_query(
+    provider: GraphProvider,
+    labels: str,
+    has_aoss: bool = False,
+    *,
+    maintain_revision: bool = False,
+) -> str:
+    if maintain_revision:
+        if provider != GraphProvider.FALKORDB:
+            raise NotImplementedError('Entity revision maintenance requires FalkorDB')
+        return f"""
+            OPTIONAL MATCH (candidate {{uuid: $entity_data.uuid}})
+            WITH collect(candidate) AS matches
+            WITH matches, size(matches) AS match_count
+            WITH match_count, CASE WHEN match_count = 1 THEN matches[0] ELSE NULL END AS existing
+            WITH match_count, existing, existing._revision AS current_revision,
+                 existing.group_id AS current_group_id
+            WHERE match_count = 0 OR
+                  (match_count = 1 AND 'Entity' IN labels(existing) AND
+                   current_group_id = $entity_data.group_id AND
+                   (current_revision IS NULL OR
+                    (current_revision >= 1 AND
+                     toString(current_revision) = toString(toInteger(current_revision)))))
+            WITH existing, current_revision,
+                 CASE WHEN existing IS NULL THEN true ELSE NOT (
+                     all(key IN [key IN keys(existing) WHERE key <> '_revision' AND
+                         key <> 'name_embedding' AND key <> 'summary_embedding']
+                         WHERE key IN keys($entity_data) AND $entity_data[key] IS NOT NULL AND
+                               existing[key] = $entity_data[key]) AND
+                     all(key IN [key IN keys($entity_data) WHERE key <> 'name_embedding' AND
+                         key <> 'summary_embedding' AND $entity_data[key] IS NOT NULL]
+                         WHERE key IN keys(existing)) AND
+                     all(label IN {labels.split(':')!r} WHERE label IN labels(existing)) AND
+                     (CASE WHEN $entity_data.name_embedding IS NULL
+                           THEN existing.name_embedding IS NULL
+                           ELSE coalesce(existing.name_embedding =
+                                vecf32($entity_data.name_embedding), false) END) AND
+                     (CASE WHEN $entity_data.summary_embedding IS NULL
+                           THEN existing.summary_embedding IS NULL
+                           ELSE coalesce(existing.summary_embedding =
+                                vecf32($entity_data.summary_embedding), false) END)
+                 ) END AS changed
+            MERGE (n:Entity {{uuid: $entity_data.uuid}})
+            FOREACH (write_marker IN CASE WHEN changed THEN [1] ELSE [] END |
+                SET n:{labels}
+                SET n = $entity_data,
+                    n.name_embedding = vecf32($entity_data.name_embedding),
+                    n.summary_embedding = CASE WHEN $entity_data.summary_embedding IS NOT NULL
+                        THEN vecf32($entity_data.summary_embedding) ELSE NULL END,
+                    n._revision = CASE WHEN existing IS NULL THEN 1
+                        ELSE coalesce(current_revision, 1) + 1 END)
+            RETURN n.uuid AS uuid, n._revision AS revision, changed AS changed
+        """
     match provider:
         case GraphProvider.FALKORDB:
             return f"""
@@ -216,8 +269,97 @@ def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: b
 
 
 def get_entity_node_save_bulk_query(
-    provider: GraphProvider, nodes: list[dict], has_aoss: bool = False
+    provider: GraphProvider,
+    nodes: list[dict],
+    has_aoss: bool = False,
+    *,
+    maintain_revision: bool = False,
 ) -> str | Any:
+    if maintain_revision:
+        if provider != GraphProvider.FALKORDB:
+            raise NotImplementedError('Bulk entity revision maintenance requires FalkorDB')
+        queries = []
+        core_properties = {
+            'uuid', 'name', 'group_id', 'summary', 'created_at', 'labels',
+            'reasoning', 'type_scores', 'type_confidence', 'synonyms',
+            'name_embedding', 'summary_embedding', '_revision',
+        }
+        for original_node in nodes:
+            node = dict(original_node)
+            node.pop('_revision', None)
+            node.setdefault('synonyms', None)
+            labels = list(dict.fromkeys(node['labels']))
+            custom_properties = [key for key in node if key not in core_properties]
+            identifiers = labels + custom_properties
+            if any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', identifier) for identifier in identifiers):
+                raise ValueError('Invalid entity label or property name')
+            label_clause = ':'.join(labels)
+            scalar_properties = [
+                'name', 'group_id', 'summary', 'created_at', 'reasoning',
+                'type_scores', 'type_confidence', 'synonyms',
+            ] + custom_properties
+            scalar_same = [
+                f'(coalesce(existing.{key} = $node.{key}, false) OR '
+                f'(existing.{key} IS NULL AND $node.{key} IS NULL))'
+                for key in scalar_properties
+            ]
+            scalar_sets = ',\n                    '.join(
+                f'n.{key} = $node.{key}' for key in scalar_properties
+            )
+            same_conditions = ' AND\n                    '.join(
+                scalar_same + [
+                    'all(label IN $node.labels WHERE label IN labels(existing))',
+                    'all(label IN $node.labels WHERE label IN coalesce(existing.labels, []))',
+                    '(CASE WHEN $node.name_embedding IS NULL '
+                    'THEN existing.name_embedding IS NULL '
+                    'ELSE coalesce(existing.name_embedding = '
+                    'vecf32($node.name_embedding), false) END)',
+                    '(CASE WHEN $node.summary_embedding IS NULL '
+                    'THEN existing.summary_embedding IS NULL '
+                    'ELSE coalesce(existing.summary_embedding = '
+                    'vecf32($node.summary_embedding), false) END)',
+                ]
+            )
+            queries.append((f"""
+                OPTIONAL MATCH (candidate {{uuid: $node.uuid}})
+                WITH collect(candidate) AS matches
+                WITH matches, size(matches) AS match_count
+                WITH match_count,
+                     CASE WHEN match_count = 1 THEN matches[0] ELSE NULL END AS existing
+                WITH match_count, existing, existing._revision AS prior_revision
+                WHERE match_count = 0 OR
+                      (match_count = 1 AND 'Entity' IN labels(existing) AND
+                       existing.group_id = $node.group_id AND
+                       (prior_revision IS NULL OR
+                        (prior_revision >= 1 AND
+                         toString(prior_revision) = toString(toInteger(prior_revision)))))
+                WITH match_count, prior_revision, existing,
+                     coalesce(existing.labels, []) AS stored_labels,
+                     CASE WHEN match_count = 0 THEN [] ELSE labels(existing) END AS physical_labels
+                WITH match_count, prior_revision, existing,
+                     stored_labels + [label IN physical_labels WHERE NOT label IN stored_labels]
+                     AS known_labels
+                WITH match_count, prior_revision, existing,
+                     known_labels + [label IN $node.labels WHERE NOT label IN known_labels]
+                     AS labels_to_save
+                WITH match_count, prior_revision, existing, labels_to_save,
+                     CASE WHEN match_count = 0 THEN true ELSE NOT (
+                         {same_conditions}
+                     ) END AS changed
+                MERGE (n:Entity {{uuid: $node.uuid}})
+                FOREACH (write_marker IN CASE WHEN changed THEN [1] ELSE [] END |
+                    SET n:{label_clause}
+                    SET {scalar_sets},
+                        n.labels = labels_to_save,
+                        n.name_embedding = vecf32($node.name_embedding),
+                        n.summary_embedding = CASE WHEN $node.summary_embedding IS NOT NULL
+                            THEN vecf32($node.summary_embedding) ELSE NULL END,
+                        n._revision = CASE WHEN match_count = 0 THEN 1
+                            ELSE coalesce(prior_revision, 1) + 1 END
+                )
+                RETURN n.uuid AS uuid, n._revision AS revision, changed AS changed
+            """, {'node': node}))
+        return queries
     # Core properties that are always present (excluding embeddings which need special handling)
     CORE_PROPERTIES = {
         'uuid', 'name', 'group_id', 'summary', 'created_at', 'labels',
@@ -318,7 +460,7 @@ def get_entity_node_save_bulk_query(
             )
 
 
-def get_entity_node_return_query(provider: GraphProvider) -> str:
+def get_entity_node_return_query(provider: GraphProvider, *, include_embeddings: bool = False) -> str:
     # `name_embedding` is not returned by default and must be loaded manually using `load_name_embedding()`.
     if provider == GraphProvider.KUZU:
         return """
@@ -331,6 +473,11 @@ def get_entity_node_return_query(provider: GraphProvider) -> str:
             n.attributes AS attributes
         """
 
+    embedding_fields = (
+        ',\n        n.name_embedding AS name_embedding,\n'
+        '        n.summary_embedding AS summary_embedding'
+        if include_embeddings else ''
+    )
     return """
         n.uuid AS uuid,
         n.name AS name,
@@ -339,7 +486,7 @@ def get_entity_node_return_query(provider: GraphProvider) -> str:
         n.summary AS summary,
         labels(n) AS labels,
         properties(n) AS attributes
-    """
+    """ + embedding_fields
 
 
 def get_community_node_save_query(provider: GraphProvider) -> str:

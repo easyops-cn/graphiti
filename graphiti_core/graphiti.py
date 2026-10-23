@@ -432,6 +432,9 @@ class Graphiti:
         nodes: list[EntityNode],
         entity_edges: list[EntityEdge],
         now: datetime,
+        *,
+        maintain_entity_revisions: bool = False,
+        maintain_edge_revisions: bool = False,
     ) -> tuple[list[EpisodicEdge], EpisodicNode]:
         """Process and save episode data to the graph."""
         episodic_edges = build_episodic_edges(nodes, episode.uuid, now)
@@ -503,6 +506,8 @@ class Graphiti:
             nodes,
             entity_edges,
             self.embedder,
+            maintain_entity_revisions=maintain_entity_revisions,
+            maintain_edge_revisions=maintain_edge_revisions,
         )
 
         return episodic_edges, episode
@@ -739,6 +744,9 @@ class Graphiti:
         kernel_to_subtypes: dict[str, list[str]] | None = None,
         user_id: str | None = None,
         user_ids: list[str] | None = None,
+        *,
+        maintain_entity_revisions: bool = False,
+        maintain_edge_revisions: bool = False,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -773,6 +781,10 @@ class Graphiti:
         previous_episode_uuids : list[str] | None
             Optional.  list of episode uuids to use as the previous episodes. If this is not provided,
             the most recent episodes by created_at date will be used.
+        maintain_entity_revisions : bool, keyword-only
+            Enable guarded entity revision maintenance for extracted entity saves.
+        maintain_edge_revisions : bool, keyword-only
+            Enable guarded relation revision maintenance for extracted relation saves.
 
         Returns
         -------
@@ -1007,7 +1019,12 @@ class Graphiti:
                 # Process and save episode data
                 step_start = time()
                 episodic_edges, episode = await self._process_episode_data(
-                    episode, hydrated_nodes, entity_edges, now
+                    episode,
+                    hydrated_nodes,
+                    entity_edges,
+                    now,
+                    maintain_entity_revisions=maintain_entity_revisions,
+                    maintain_edge_revisions=maintain_edge_revisions,
                 )
                 perf_logger.info(f'[PERF] _process_episode_data (DB write): {(time() - step_start)*1000:.0f}ms')
 
@@ -1071,6 +1088,9 @@ class Graphiti:
         excluded_entity_types: list[str] | None = None,
         edge_types: dict[str, type[BaseModel]] | None = None,
         edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+        *,
+        maintain_entity_revisions: bool = False,
+        maintain_edge_revisions: bool = False,
     ) -> AddBulkEpisodeResults:
         """
         Process multiple episodes in bulk and update the graph.
@@ -1084,6 +1104,10 @@ class Graphiti:
             A list of RawEpisode objects to be processed and added to the graph.
         group_id : str | None
             An id for the graph partition the episode is a part of.
+        maintain_entity_revisions : bool, keyword-only
+            Enable guarded entity revision maintenance for the extracted entity save.
+        maintain_edge_revisions : bool, keyword-only
+            Enable guarded relation revision maintenance for the extracted relation save.
 
         Returns
         -------
@@ -1232,6 +1256,8 @@ class Graphiti:
                     final_hydrated_nodes,
                     resolved_edges + invalidated_edges,
                     self.embedder,
+                    maintain_entity_revisions=maintain_entity_revisions,
+                    maintain_edge_revisions=maintain_edge_revisions,
                 )
 
                 end = time()
@@ -1419,7 +1445,13 @@ class Graphiti:
         return SearchResults(edges=edges, nodes=nodes)
 
     async def add_triplet(
-        self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode
+        self,
+        source_node: EntityNode,
+        edge: EntityEdge,
+        target_node: EntityNode,
+        *,
+        maintain_entity_revisions: bool = False,
+        maintain_edge_revisions: bool = False,
     ) -> AddTripletResults:
         if source_node.name_embedding is None:
             await source_node.generate_name_embedding(self.embedder)
@@ -1438,10 +1470,13 @@ class Graphiti:
         )
 
         updated_edge = resolve_edge_pointers([edge], uuid_map)[0]
+        requested_edge_name = updated_edge.name
+        requested_attributes = dict(updated_edge.attributes)
 
         valid_edges = await EntityEdge.get_between_nodes(
             self.driver, edge.source_node_uuid, edge.target_node_uuid
         )
+        valid_edges = [candidate for candidate in valid_edges if candidate.name == requested_edge_name]
 
         related_edges = (
             await search(
@@ -1479,13 +1514,24 @@ class Graphiti:
             None,
             None,
         )
+        resolved_edge.name = requested_edge_name
+        resolved_edge.attributes = {**resolved_edge.attributes, **requested_attributes}
 
         edges: list[EntityEdge] = [resolved_edge] + invalidated_edges
 
         await create_entity_edge_embeddings(self.embedder, edges)
         await create_entity_node_embeddings(self.embedder, nodes)
 
-        await add_nodes_and_edges_bulk(self.driver, [], [], nodes, edges, self.embedder)
+        await add_nodes_and_edges_bulk(
+            self.driver,
+            [],
+            [],
+            nodes,
+            edges,
+            self.embedder,
+            maintain_entity_revisions=maintain_entity_revisions,
+            maintain_edge_revisions=maintain_edge_revisions,
+        )
         return AddTripletResults(edges=edges, nodes=nodes)
 
     async def remove_episode(self, episode_uuid: str):

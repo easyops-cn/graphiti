@@ -607,7 +607,19 @@ class EntityNode(Node):
 
         self.name_embedding = records[0]['name_embedding']
 
-    async def save(self, driver: GraphDriver):
+    async def save(self, driver: GraphDriver, *, maintain_revision: bool = False):
+        if maintain_revision:
+            attributes = self.attributes or {}
+            if (
+                ('uuid' in attributes and attributes['uuid'] != self.uuid)
+                or ('group_id' in attributes and attributes['group_id'] != self.group_id)
+            ):
+                raise ValueError(f'Entity revision identity conflict for {self.uuid}')
+        if maintain_revision and (
+            driver.provider != GraphProvider.FALKORDB
+            or driver.graph_operations_interface is not None
+        ):
+            raise NotImplementedError('Entity revision maintenance requires the FalkorDB save query')
         if driver.graph_operations_interface:
             return await driver.graph_operations_interface.node_save(self, driver)
 
@@ -636,27 +648,51 @@ class EntityNode(Node):
             )
         else:
             entity_data.update(self.attributes or {})
+            if maintain_revision:
+                entity_data.pop('_revision', None)
+                entity_data['uuid'] = self.uuid
+                entity_data['group_id'] = self.group_id
             # EasyOps: Ensure top-level synonyms takes precedence over attributes spread
             entity_data['synonyms'] = self.synonyms if self.synonyms else None
             labels = ':'.join(self.labels + ['Entity'])
 
             result = await driver.execute_query(
-                get_entity_node_save_query(driver.provider, labels),
+                get_entity_node_save_query(driver.provider, labels, maintain_revision=maintain_revision),
                 entity_data=entity_data,
             )
+
+        if maintain_revision:
+            records = result[0] if isinstance(result, tuple) and result else None
+            if (
+                not isinstance(records, list)
+                or len(records) != 1
+                or not isinstance(records[0], dict)
+                or set(records[0]) != {'uuid', 'revision', 'changed'}
+                or records[0]['uuid'] != self.uuid
+                or type(records[0]['changed']) is not bool
+                or (records[0]['revision'] is None and records[0]['changed'])
+                or (records[0]['revision'] is not None and
+                    (type(records[0]['revision']) is not int or records[0]['revision'] < 1))
+            ):
+                raise ValueError(f'Entity revision save rejected for {self.uuid}')
+            result = ([{'uuid': self.uuid}], ['uuid'] if result[1] is not None else None, *result[2:])
 
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 
         return result
 
     @classmethod
-    async def get_by_uuid(cls, driver: GraphDriver, uuid: str):
+    async def get_by_uuid(
+        cls, driver: GraphDriver, uuid: str, *, include_embeddings: bool = False
+    ):
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Entity {uuid: $uuid})
             RETURN
             """
-            + get_entity_node_return_query(driver.provider),
+            + get_entity_node_return_query(
+                driver.provider, include_embeddings=include_embeddings
+            ),
             uuid=uuid,
             routing_='r',
         )
@@ -942,6 +978,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         uuid=record['uuid'],
         name=record['name'],
         name_embedding=record.get('name_embedding'),
+        summary_embedding=record.get('summary_embedding'),
         group_id=group_id,
         labels=labels,
         created_at=parse_db_date(record['created_at']),  # type: ignore
