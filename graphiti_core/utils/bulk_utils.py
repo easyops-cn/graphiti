@@ -945,10 +945,17 @@ async def add_nodes_and_edges_bulk(
     entity_nodes: list[EntityNode],
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
+    *,
+    maintain_entity_revisions: bool = False,
+    maintain_edge_revisions: bool = False,
 ):
+    if maintain_entity_revisions:
+        _validate_bulk_entity_revision_input(driver, entity_nodes)
+    if maintain_edge_revisions:
+        _validate_bulk_edge_revision_input(driver, entity_edges)
     session = driver.session()
     try:
-        await session.execute_write(
+        result = await session.execute_write(
             add_nodes_and_edges_bulk_tx,
             episodic_nodes,
             episodic_edges,
@@ -956,9 +963,51 @@ async def add_nodes_and_edges_bulk(
             entity_edges,
             embedder,
             driver=driver,
+            **({'maintain_entity_revisions': True} if maintain_entity_revisions else {}),
+            **({'maintain_edge_revisions': True} if maintain_edge_revisions else {}),
         )
+        if maintain_entity_revisions or maintain_edge_revisions:
+            return result
     finally:
         await session.close()
+
+
+def _validate_bulk_entity_revision_input(
+    driver: GraphDriver, entity_nodes: list[EntityNode]
+) -> None:
+    if (
+        driver.provider != GraphProvider.FALKORDB
+        or driver.graph_operations_interface is not None
+    ):
+        raise NotImplementedError('Bulk entity revision maintenance requires FalkorDB')
+    for node in entity_nodes:
+        attributes = node.attributes or {}
+        if (
+            ('uuid' in attributes and attributes['uuid'] != node.uuid)
+            or ('group_id' in attributes and attributes['group_id'] != node.group_id)
+        ):
+            raise ValueError(f'Bulk entity revision identity conflict for {node.uuid}')
+        if 'labels' in attributes:
+            labels = attributes['labels']
+            if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+                raise ValueError(f'Bulk entity revision labels conflict for {node.uuid}')
+            if set(labels) != set(node.labels + ['Entity']):
+                raise ValueError(f'Bulk entity revision labels conflict for {node.uuid}')
+
+
+def _validate_bulk_edge_revision_input(
+    driver: GraphDriver, entity_edges: list[EntityEdge]
+) -> None:
+    if (
+        driver.provider != GraphProvider.FALKORDB
+        or driver.graph_operations_interface is not None
+    ):
+        raise NotImplementedError('Bulk relation revision maintenance requires FalkorDB')
+    for edge in entity_edges:
+        edge._revision_edge_data()
+        get_entity_edge_save_bulk_query_by_type(
+            driver.provider, edge.name, maintain_revision=True,
+        )
 
 
 async def add_nodes_and_edges_bulk_tx(
@@ -969,7 +1018,18 @@ async def add_nodes_and_edges_bulk_tx(
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
     driver: GraphDriver,
+    *,
+    maintain_entity_revisions: bool = False,
+    maintain_edge_revisions: bool = False,
 ):
+    if maintain_entity_revisions:
+        _validate_bulk_entity_revision_input(driver, entity_nodes)
+        if not callable(getattr(tx, 'run_with_result', None)):
+            raise NotImplementedError('Bulk entity revisions require result-bearing FalkorDB session')
+    if maintain_edge_revisions:
+        _validate_bulk_edge_revision_input(driver, entity_edges)
+        if not callable(getattr(tx, 'run_with_result', None)):
+            raise NotImplementedError('Bulk relation revisions require result-bearing FalkorDB session')
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
@@ -1022,6 +1082,11 @@ async def add_nodes_and_edges_bulk_tx(
         else:
             # Sanitize attributes to only include primitive types (FalkorDB requirement)
             entity_data.update(_sanitize_attributes(node.attributes))
+            if maintain_entity_revisions:
+                entity_data.pop('_revision', None)
+                entity_data['uuid'] = node.uuid
+                entity_data['group_id'] = node.group_id
+                entity_data['labels'] = list(set(node.labels + ['Entity']))
 
         nodes.append(entity_data)
 
@@ -1051,6 +1116,7 @@ async def add_nodes_and_edges_bulk_tx(
             'invalid_at': edge.invalid_at,
             'fact_embedding': edge.fact_embedding,
         }
+        trusted_edge_data = edge_data.copy() if maintain_edge_revisions else None
 
         if driver.provider == GraphProvider.KUZU:
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
@@ -1058,6 +1124,11 @@ async def add_nodes_and_edges_bulk_tx(
         else:
             # Sanitize attributes to only include primitive types (FalkorDB requirement)
             edge_data.update(_sanitize_attributes(edge.attributes))
+            if maintain_edge_revisions and trusted_edge_data is not None:
+                edge_data.pop('_revision', None)
+                edge_data.pop('source_uuid', None)
+                edge_data.pop('target_uuid', None)
+                edge_data.update(trusted_edge_data)
 
         edges.append(edge_data)
 
@@ -1091,10 +1162,36 @@ async def add_nodes_and_edges_bulk_tx(
         await tx.run(episode_query, episodes=episodes)
 
         # Entity nodes - iterate over query tuples
-        entity_node_queries = get_entity_node_save_bulk_query(driver.provider, nodes)
+        entity_node_queries = get_entity_node_save_bulk_query(
+            driver.provider, nodes, maintain_revision=maintain_entity_revisions,
+        )
+        if maintain_entity_revisions and len(entity_node_queries) != len(nodes):
+            raise ValueError('Bulk entity revision query count mismatch')
         logger.info(f'[bulk_save] Saving {len(nodes)} entity nodes ({len(entity_node_queries)} queries)')
-        for query, params in entity_node_queries:
-            await tx.run(query, **params)
+        receipts = []
+        if maintain_entity_revisions:
+            for node, (query, params) in zip(nodes, entity_node_queries):
+                result = await tx.run_with_result(query, **params)
+                records = result[0] if isinstance(result, tuple) and result else None
+                if (
+                    not isinstance(records, list)
+                    or len(records) != 1
+                    or not isinstance(records[0], dict)
+                    or set(records[0]) != {'uuid', 'revision', 'changed'}
+                    or records[0].get('uuid') != node['uuid']
+                    or type(records[0].get('changed')) is not bool
+                    or not (
+                        (type(records[0].get('revision')) is int and
+                         records[0]['revision'] >= 1)
+                        or (records[0].get('revision') is None and
+                            records[0]['changed'] is False)
+                    )
+                ):
+                    raise ValueError(f'Bulk entity revision save rejected for {node["uuid"]}')
+                receipts.append(records[0])
+        else:
+            for query, params in entity_node_queries:
+                await tx.run(query, **params)
 
         # Episodic edges
         await tx.run(
@@ -1110,10 +1207,37 @@ async def add_nodes_and_edges_bulk_tx(
                 edges_by_type[edge_type] = []
             edges_by_type[edge_type].append(edge)
 
+        edge_receipts = []
         for edge_type, typed_edges in edges_by_type.items():
-            query = get_entity_edge_save_bulk_query_by_type(driver.provider, edge_type)
+            query = get_entity_edge_save_bulk_query_by_type(
+                driver.provider, edge_type, maintain_revision=maintain_edge_revisions,
+            )
             logger.info(f'[bulk_save] Saving {len(typed_edges)} edges of type {edge_type}')
-            await tx.run(query, entity_edges=typed_edges)
+            if maintain_edge_revisions:
+                for edge in typed_edges:
+                    result = await tx.run_with_result(query, edge=edge)
+                    records = result[0] if isinstance(result, tuple) and result else None
+                    record = records[0] if isinstance(records, list) and len(records) == 1 else None
+                    if (
+                        not isinstance(record, dict)
+                        or set(record) != {'uuid', 'revision', 'changed', 'previous_uuid'}
+                        or record['uuid'] != edge['uuid']
+                        or type(record['changed']) is not bool
+                        or not (
+                            (type(record['revision']) is int and record['revision'] >= 1)
+                            or (record['revision'] is None and not record['changed'])
+                        )
+                        or (record['previous_uuid'] is not None and
+                            not isinstance(record['previous_uuid'], str))
+                    ):
+                        raise ValueError(f'Bulk relation revision save rejected for {edge["uuid"]}')
+                    edge_receipts.append(record)
+            else:
+                await tx.run(query, entity_edges=typed_edges)
+        if maintain_edge_revisions:
+            return {'entities': receipts, 'edges': edge_receipts}
+        if maintain_entity_revisions:
+            return receipts
     else:
         # Log bulk save operation details for debugging
         episode_query = get_episode_node_save_bulk_query(driver.provider)

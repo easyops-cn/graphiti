@@ -36,6 +36,7 @@ from graphiti_core.models.edges.edge_db_queries import (
     get_community_edge_save_query,
     get_entity_edge_return_query,
     get_entity_edge_save_query,
+    get_entity_edge_temporal_replace_query,
 )
 from graphiti_core.nodes import Node
 
@@ -285,8 +286,8 @@ class EntityEdge(Edge):
 
         self.fact_embedding = records[0]['fact_embedding']
 
-    async def save(self, driver: GraphDriver):
-        edge_data: dict[str, Any] = {
+    def _edge_data(self) -> dict[str, Any]:
+        return {
             'source_uuid': self.source_node_uuid,
             'target_uuid': self.target_node_uuid,
             'uuid': self.uuid,
@@ -301,6 +302,69 @@ class EntityEdge(Edge):
             'invalid_at': self.invalid_at,
         }
 
+    def _revision_edge_data(self) -> dict[str, Any]:
+        attributes = self.attributes or {}
+        identities = {
+            'uuid': self.uuid,
+            'group_id': self.group_id,
+            'source_uuid': self.source_node_uuid,
+            'target_uuid': self.target_node_uuid,
+            'source_node_uuid': self.source_node_uuid,
+            'target_node_uuid': self.target_node_uuid,
+            'name': self.name,
+            'created_at': self.created_at,
+            'valid_at': self.valid_at,
+            'invalid_at': self.invalid_at,
+            'expired_at': self.expired_at,
+        }
+        if any(key in attributes and attributes[key] != value for key, value in identities.items()):
+            raise ValueError(f'Edge revision identity conflict for {self.uuid}')
+        edge_data = self._edge_data()
+        edge_data.update(attributes)
+        for key in ('_revision', 'source_node_uuid', 'target_node_uuid'):
+            edge_data.pop(key, None)
+        for key in (
+            'uuid', 'group_id', 'source_uuid', 'target_uuid',
+            'name', 'created_at', 'valid_at', 'invalid_at', 'expired_at',
+        ):
+            edge_data[key] = identities[key]
+        return edge_data
+
+    @staticmethod
+    def _verify_revision_receipt(result: Any, **expected: str) -> None:
+        records = result[0] if isinstance(result, tuple) and result else None
+        if (
+            not isinstance(records, list)
+            or len(records) != 1
+            or not isinstance(records[0], dict)
+            or any(records[0].get(key) != value for key, value in expected.items())
+        ):
+            raise ValueError('Edge revision save rejected')
+
+    @staticmethod
+    def _verify_single_save_revision_receipt(result: Any, uuid: str) -> None:
+        records = result[0] if isinstance(result, tuple) and result else None
+        if (
+            not isinstance(records, list)
+            or len(records) != 1
+            or not isinstance(records[0], dict)
+            or set(records[0]) != {'uuid', 'revision', 'changed'}
+            or records[0]['uuid'] != uuid
+            or type(records[0]['changed']) is not bool
+            or (records[0]['revision'] is None and records[0]['changed'])
+            or (records[0]['revision'] is not None and
+                (type(records[0]['revision']) is not int or records[0]['revision'] < 1))
+        ):
+            raise ValueError('Edge revision save rejected')
+
+    async def save(self, driver: GraphDriver, *, maintain_revision: bool = False):
+        if maintain_revision and (
+            driver.provider != GraphProvider.FALKORDB
+            or driver.graph_operations_interface is not None
+        ):
+            raise NotImplementedError('Edge revision maintenance requires the FalkorDB save query')
+        edge_data = self._revision_edge_data() if maintain_revision else self._edge_data()
+
         if driver.provider == GraphProvider.KUZU:
             edge_data['attributes'] = json.dumps(self.attributes)
             result = await driver.execute_query(
@@ -308,14 +372,55 @@ class EntityEdge(Edge):
                 **edge_data,
             )
         else:
-            edge_data.update(self.attributes or {})
+            if not maintain_revision:
+                edge_data.update(self.attributes or {})
             result = await driver.execute_query(
-                get_entity_edge_save_query(driver.provider),
+                get_entity_edge_save_query(driver.provider, maintain_revision=maintain_revision),
                 edge_data=edge_data,
             )
 
+        if maintain_revision:
+            self._verify_single_save_revision_receipt(result, self.uuid)
+            result = ([{'uuid': self.uuid}], ['uuid'] if result[1] is not None else None, *result[2:])
+
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 
+        return result
+
+    async def replace_temporally(self, driver: GraphDriver, replacement: 'EntityEdge'):
+        if (
+            driver.provider != GraphProvider.FALKORDB
+            or driver.graph_operations_interface is not None
+        ):
+            raise NotImplementedError('Temporal edge replacement requires FalkorDB')
+        self._revision_edge_data()
+        edge_data = replacement._revision_edge_data()
+        if (
+            self.uuid == replacement.uuid
+            or self.group_id != replacement.group_id
+            or self.name != replacement.name
+            or self.source_node_uuid != replacement.source_node_uuid
+            or self.target_node_uuid != replacement.target_node_uuid
+            or self.invalid_at is None
+            or self.expired_at is None
+            or replacement.invalid_at is not None
+            or replacement.expired_at is not None
+        ):
+            raise ValueError('Temporal edge replacement identity or timestamps conflict')
+        result = await driver.execute_query(
+            get_entity_edge_temporal_replace_query(driver.provider),
+            old_data={
+                'uuid': self.uuid,
+                'group_id': self.group_id,
+                'name': self.name,
+                'source_uuid': self.source_node_uuid,
+                'target_uuid': self.target_node_uuid,
+                'invalid_at': self.invalid_at,
+                'expired_at': self.expired_at,
+            },
+            edge_data=edge_data,
+        )
+        self._verify_revision_receipt(result, old_uuid=self.uuid, new_uuid=replacement.uuid)
         return result
 
     @classmethod

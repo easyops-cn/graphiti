@@ -16,6 +16,7 @@ limitations under the License.
 
 import asyncio
 import datetime
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -131,6 +132,14 @@ class FalkorDriverSession(GraphDriverSession):
                 raise
         # Assuming `graph.query` is async (ideal); otherwise, wrap in executor
         return None
+
+    async def run_with_result(self, query: str, **kwargs: Any) -> tuple[list[dict], list[str], None]:
+        if not query or not query.strip():
+            raise ValueError('Empty Cypher query')
+        result = await self.graph.query(str(query), convert_datetimes_to_strings(dict(kwargs)))
+        header = [column[1] for column in result.header]
+        records = [dict(zip(header, row)) for row in result.result_set]
+        return records, header, None
 
 
 class FalkorDriver(GraphDriver):
@@ -268,6 +277,529 @@ class FalkorDriver(GraphDriver):
             records.append(record)
 
         return records, header, None
+
+    @staticmethod
+    def _graph_write_identifier(value: Any, field: str) -> str:
+        """Validate an identifier before it is interpolated into Cypher."""
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value):
+            raise ValueError(f'Invalid graph-write {field}')
+        return value
+
+    @staticmethod
+    def _graph_write_properties(value: Any, field: str) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError(f'Graph-write {field} must be an object')
+        reserved = {
+            'uuid', 'group_id', '_revision', '_action_execution_id', '_updated_at',
+            'source_uuid', 'target_uuid', 'valid_at', 'invalid_at', 'expired_at',
+            'created_at', 'updated_at', 'episodes', 'name_embedding', 'summary_embedding', 'fact_embedding',
+            'labels', 'source_node_uuid', 'target_node_uuid',
+            '_previous_edge_uuid',
+        }
+        if reserved.intersection(value):
+            raise ValueError(f'Graph-write {field} contains reserved properties')
+        # A JSON round-trip rejects non-primitive values before they reach FalkorDB.
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'Graph-write {field} is not JSON serializable') from error
+        return value
+
+    @classmethod
+    def _graph_write_query(cls, request: Any, context: Any) -> tuple[str, dict[str, Any]]:
+        """Build one guarded Cypher query for a structured graph write.
+
+        The query deliberately uses only fixed graph primitives (``Entity`` and
+        ``RELATES_TO``). Logical entity/edge names are values in the request; the
+        only interpolated labels have been validated by ``_graph_write_identifier``.
+        All checks happen before the write ``FOREACH`` clauses, so a rejected plan
+        executes no mutation and a runtime FalkorDB error rolls the query back.
+        """
+        if not hasattr(request, 'model_dump'):
+            raise ValueError('Structured graph-write request is required')
+        payload = request.model_dump(mode='python')
+        edits = payload.get('edits')
+        state = payload.get('expected_state') or {}
+        if not isinstance(edits, list) or not edits:
+            raise ValueError('Graph-write request must contain edits')
+        group_id = getattr(context, 'group_id', None)
+        if not isinstance(group_id, str) or not group_id.strip():
+            raise ValueError('Graph-write tenant is required')
+        person_id = getattr(context, 'person_id', None)
+        if not isinstance(person_id, str) or not person_id.strip():
+            raise ValueError('Graph-write authenticated person is required')
+
+        entity_ids: list[str] = list(state.get('absent_ids') or [])
+        edge_ids: list[str] = list(state.get('absent_ids') or [])
+        created_entity_ids = [edit['uuid'] for edit in edits
+                              if edit.get('kind') == 'entity' and edit.get('operation') == 'create']
+        for edit in edits:
+            if edit.get('kind') == 'entity':
+                entity_ids.append(edit['uuid'])
+            elif edit.get('kind') == 'edge':
+                edge_ids.append(edit['uuid'])
+            else:
+                raise ValueError('Unsupported graph-write resource kind')
+            for endpoint in ('source_id', 'target_id'):
+                if edit.get(endpoint):
+                    entity_ids.append(edit[endpoint])
+        for snapshot in (state.get('snapshots') or {}).values():
+            if snapshot.get('kind') == 'entity':
+                entity_ids.append(snapshot['uuid'])
+            elif snapshot.get('kind') == 'edge':
+                edge_ids.append(snapshot['uuid'])
+                entity_ids.extend([snapshot['source_id'], snapshot['target_id']])
+        for dependency in state.get('relation_dependencies') or []:
+            entity_ids.extend([dependency['source_id'], dependency['target_id']])
+            for member in dependency.get('expected_matches') or []:
+                edge_ids.append(member['uuid'])
+        endpoint_ids = list(dict.fromkeys(
+            item[endpoint]
+            for item in (
+                *[edit for edit in edits if edit['kind'] == 'edge'],
+                *[snapshot for snapshot in (state.get('snapshots') or {}).values()
+                  if snapshot['kind'] == 'edge'],
+                *(state.get('relation_dependencies') or []),
+                *(state.get('unique_active_edges') or []),
+            )
+            for endpoint in ('source_id', 'target_id')
+        ))
+        entity_ids.extend(endpoint_ids)
+        entity_ids = list(dict.fromkeys(entity_ids))
+        edge_ids = list(dict.fromkeys(edge_ids))
+
+        params: dict[str, Any] = {
+            'group_id': group_id,
+            'person_id': person_id,
+            'request_id': payload['request_id'],
+            'source_ref': payload['source_ref'],
+            'request_hash': '',
+            'entity_ids': entity_ids,
+            'edge_ids': edge_ids,
+            'created_entity_ids': created_entity_ids,
+            'now': (payload['effective_at'].isoformat() if payload.get('effective_at') is not None
+                    else datetime.datetime.now(datetime.UTC).isoformat()),
+            'snapshot_reserved_entity_keys': [
+                'uuid', 'group_id', '_revision', '_action_execution_id', '_updated_at',
+                'source_uuid', 'target_uuid', 'valid_at', 'invalid_at', 'expired_at',
+                'created_at', 'name', 'summary', 'name_embedding', 'summary_embedding', 'labels',
+            ],
+            'snapshot_reserved_edge_keys': [
+                'uuid', 'group_id', 'name', '_revision', '_action_execution_id', '_updated_at',
+                'source_uuid', 'target_uuid', 'valid_at', 'invalid_at', 'expired_at',
+                'created_at', 'updated_at', 'fact', 'fact_embedding', 'episodes',
+                'source_node_uuid', 'target_node_uuid',
+                '_previous_edge_uuid',
+            ],
+        }
+        property_keys: dict[int, str] = {}
+        for index, edit in enumerate(edits):
+            if edit['operation'] != 'delete':
+                property_keys[index] = f'props_{index}'
+                params[property_keys[index]] = cls._graph_write_properties(
+                    edit.get('properties') or {}, f'edit {edit["uuid"]}'
+                )
+        clauses = [
+            'OPTIONAL MATCH (prior_receipt:ActionGraphWriteReceipt) '
+            'WHERE prior_receipt.group_id = $group_id AND prior_receipt.request_id = $request_id',
+            'WITH [item IN collect(prior_receipt) WHERE item IS NOT NULL] AS prior_receipts',
+            'OPTIONAL MATCH (node_candidate) WHERE node_candidate.uuid IN $entity_ids',
+            'WITH prior_receipts, collect(node_candidate) AS node_candidates',
+            'OPTIONAL MATCH (edge_source)-[edge_candidate]->(edge_target) '
+            'WHERE edge_candidate.uuid IN $edge_ids',
+            "WITH prior_receipts, node_candidates, [item IN collect(CASE WHEN edge_candidate IS NULL THEN NULL "
+            "ELSE {uuid: edge_candidate.uuid, edge: edge_candidate, source_uuid: edge_source.uuid, "
+            "target_uuid: edge_target.uuid, source: edge_source, target: edge_target, "
+            "logical_type: coalesce(edge_candidate.name, type(edge_candidate))} END) "
+            'WHERE item IS NOT NULL] AS edge_candidates',
+            'OPTIONAL MATCH (incident_source)-[incident_edge]-(incident_target) '
+            'WHERE incident_source.uuid IN $entity_ids OR incident_target.uuid IN $entity_ids',
+            "WITH prior_receipts, node_candidates, edge_candidates, [item IN collect(CASE WHEN incident_edge IS NULL THEN NULL "
+            "ELSE {source_uuid: incident_source.uuid, target_uuid: incident_target.uuid} END) "
+            'WHERE item IS NOT NULL] AS incident_edges',
+            'OPTIONAL MATCH (active_source)-[active_edge]->(active_target) '
+            'WHERE active_edge.group_id = $group_id AND active_edge.invalid_at IS NULL '
+            'AND active_edge.expired_at IS NULL',
+            "WITH prior_receipts, node_candidates, edge_candidates, incident_edges, [item IN collect(CASE WHEN active_edge IS NULL THEN NULL "
+            "ELSE {uuid: active_edge.uuid, source_uuid: active_source.uuid, target_uuid: active_target.uuid, "
+            "source: active_source, target: active_target, "
+            "logical_type: coalesce(active_edge.name, type(active_edge)), edge: active_edge} END) "
+            'WHERE item IS NOT NULL] AS active_edges',
+        ]
+
+        def node_expr(uuid: str) -> str:
+            return (
+                f'head([n IN node_candidates WHERE n.uuid = {json.dumps(uuid)} '
+                f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)])'
+            )
+
+        def edge_expr(uuid: str) -> str:
+            return f'head([item IN edge_candidates WHERE item.uuid = {json.dumps(uuid)}])'
+
+        def edge_matches_expr(type_name: str, source_id: str, target_id: str, parameter: str | None = None) -> str:
+            """Return a bounded active-edge selection expression.
+
+            The relation dependency is evaluated against the endpoint-bound edge
+            objects collected by the same query. UUID strings alone are not enough:
+            a non-Entity node may share an UUID with a legitimate endpoint.
+            """
+            if parameter is None:
+                return (
+                    f'[item IN active_edges WHERE item.logical_type = {json.dumps(type_name)} '
+                    f'AND item.source_uuid = {json.dumps(source_id)} '
+                    f'AND item.target_uuid = {json.dumps(target_id)} '
+                    f'AND item.source = {node_expr(source_id)} '
+                    f'AND item.target = {node_expr(target_id)}]'
+                )
+            return (
+                f'[item IN active_edges WHERE item.logical_type = {parameter}.type_name '
+                f'AND item.source_uuid = {parameter}.source_id '
+                f'AND item.target_uuid = {parameter}.target_id '
+                f'AND item.source = {node_expr(source_id)} '
+                f'AND item.target = {node_expr(target_id)}]'
+            )
+
+        gates: list[str] = []
+        revisions = state.get('revisions') or {}
+        snapshots = state.get('snapshots') or {}
+        absent_ids = set(state.get('absent_ids') or [])
+        isolated_ids = set(state.get('isolated_entity_ids') or [])
+        endpoint_map = state.get('expected_edge_endpoints') or {}
+        for snapshot_index, snapshot in enumerate(snapshots.values()):
+            params[f'snapshot_props_{snapshot_index}'] = cls._graph_write_properties(
+                snapshot.get('properties') or {}, f'snapshot {snapshot["uuid"]}'
+            )
+            params[f'snapshot_keys_{snapshot_index}'] = list(
+                params[f'snapshot_props_{snapshot_index}'].keys()
+            )
+            params[f'snapshot_valid_{snapshot_index}'] = snapshot.get('valid_at')
+            params[f'snapshot_invalid_{snapshot_index}'] = snapshot.get('invalid_at')
+            params[f'snapshot_expired_{snapshot_index}'] = snapshot.get('expired_at')
+            if snapshot.get('created_at') is not None:
+                params[f'snapshot_created_{snapshot_index}'] = snapshot['created_at'].isoformat()
+        for edit in edits:
+            uuid = edit['uuid']
+            if edit['operation'] == 'create':
+                gates.append(
+                    f'size([n IN node_candidates WHERE n.uuid = {json.dumps(uuid)}]) = 0 '
+                    f'AND size([item IN edge_candidates WHERE item.uuid = {json.dumps(uuid)}]) = 0'
+                )
+                if uuid not in absent_ids:
+                    gates.append('false')
+            else:
+                if edit['kind'] == 'entity':
+                    current = node_expr(uuid)
+                    gates.extend([
+                        f'size([n IN node_candidates WHERE n.uuid = {json.dumps(uuid)}]) = 1',
+                        f'coalesce({current}.group_id, "") = $group_id',
+                        f'{json.dumps(edit["type_name"])} IN labels({current})',
+                    ])
+                    if uuid in revisions:
+                        gates.append(f'typeOf({current}._revision) = "Integer"')
+                        gates.append(f'coalesce({current}._revision, -1) = {int(revisions[uuid])}')
+                    if uuid in isolated_ids:
+                        gates.append(
+                            f'size([incident IN incident_edges WHERE incident.source_uuid = {json.dumps(uuid)} '
+                            f'OR incident.target_uuid = {json.dumps(uuid)}]) = 0'
+                        )
+                else:
+                    current = edge_expr(uuid)
+                    gates.extend([
+                        f'size([item IN edge_candidates WHERE item.uuid = {json.dumps(uuid)}]) = 1',
+                        f'coalesce({current}.edge.group_id, "") = $group_id',
+                        f'{current}.logical_type = {json.dumps(edit["type_name"])}',
+                        f'{current}.source_uuid = {json.dumps(edit["source_id"])}',
+                        f'{current}.target_uuid = {json.dumps(edit["target_id"])}',
+                        f'{current}.source = {node_expr(edit["source_id"])}',
+                        f'{current}.target = {node_expr(edit["target_id"])}',
+                        f'{current}.edge.invalid_at IS NULL',
+                        f'(size([n IN node_candidates WHERE n.uuid = {json.dumps(edit["source_id"])} '
+                        f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)]) = 1 '
+                        f'OR {json.dumps(edit["source_id"])} IN $created_entity_ids)',
+                        f'(size([n IN node_candidates WHERE n.uuid = {json.dumps(edit["target_id"])} '
+                        f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)]) = 1 '
+                        f'OR {json.dumps(edit["target_id"])} IN $created_entity_ids)',
+                    ])
+                    if uuid in revisions:
+                        gates.append(f'typeOf({current}.edge._revision) = "Integer"')
+                        gates.append(f'coalesce({current}.edge._revision, -1) = {int(revisions[uuid])}')
+                    expected = endpoint_map.get(uuid)
+                    if expected and (expected.get('source_id'), expected.get('target_id')) != (
+                        edit.get('source_id'), edit.get('target_id')
+                    ):
+                        gates.append('false')
+
+        # A relation dependency is a complete server-generated result, including
+        # an explicit empty result. Re-resolve it in this query so an unchanged
+        # endpoint revision cannot hide a relation insert/delete/replace.
+        for dependency_index, dependency in enumerate(state.get('relation_dependencies') or []):
+            member = (dependency.get('expected_matches') or [None])[0]
+            parameter = f'$relation_dependency_{dependency_index}'
+            params[f'relation_dependency_{dependency_index}'] = {
+                'type_name': dependency['type_name'],
+                'source_id': dependency['source_id'],
+                'target_id': dependency['target_id'],
+                'expected_uuid': member.get('uuid') if member else None,
+                'expected_revision': member.get('revision') if member else None,
+            }
+            source_id = dependency['source_id']
+            target_id = dependency['target_id']
+            relation_matches = edge_matches_expr(
+                dependency['type_name'], source_id, target_id,
+                parameter=parameter,
+            )
+            gates.extend([
+                f'size([n IN node_candidates WHERE n.uuid = {json.dumps(source_id)} '
+                f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)]) = 1',
+                f'size([n IN node_candidates WHERE n.uuid = {json.dumps(target_id)} '
+                f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)]) = 1',
+            ])
+            if member is None:
+                gates.append(f'size({relation_matches}) = 0')
+            else:
+                gates.extend([
+                    f'size({relation_matches}) = 1',
+                    f'head({relation_matches}).uuid = {parameter}.expected_uuid',
+                    f'typeOf(head({relation_matches}).edge._revision) = "Integer"',
+                    f'coalesce(head({relation_matches}).edge._revision, -1) = '
+                    f'{parameter}.expected_revision',
+                ])
+
+        for uuid, expected in revisions.items():
+            if any(edit['uuid'] == uuid for edit in edits):
+                continue
+            if uuid in snapshots:
+                continue
+            gates.append('false')
+        for uuid, snapshot in snapshots.items():
+            expected_revision = snapshot.get('revision') or revisions.get(uuid)
+            snapshot_index = list(snapshots).index(uuid)
+            if snapshot.get('kind') == 'entity':
+                current = node_expr(uuid)
+                gates.extend([
+                    f'size([n IN node_candidates WHERE n.uuid = {json.dumps(uuid)}]) = 1',
+                    f'coalesce({current}.group_id, "") = $group_id',
+                    f'{json.dumps(snapshot["type_name"])} IN labels({current})',
+                    f'all(key IN keys($snapshot_props_{snapshot_index}) WHERE '
+                    f'({current}[key] = $snapshot_props_{snapshot_index}[key] OR '
+                    f'({current}[key] IS NULL AND $snapshot_props_{snapshot_index}[key] IS NULL)))',
+                    f'all(key IN keys({current}) WHERE key IN $snapshot_keys_{snapshot_index} '
+                    f'OR {current}[key] IS NULL '
+                    f'OR key IN $snapshot_reserved_entity_keys)',
+                ])
+                if expected_revision is not None:
+                    gates.append(f'typeOf({current}._revision) = "Integer"')
+                    gates.append(f'{current}._revision = {int(expected_revision)}')
+                if snapshot.get('created_at') is not None:
+                    gates.append(f'{current}.created_at = $snapshot_created_{snapshot_index}')
+            else:
+                current = edge_expr(uuid)
+                gates.extend([
+                    f'size([item IN edge_candidates WHERE item.uuid = {json.dumps(uuid)}]) = 1',
+                    f'coalesce({current}.edge.group_id, "") = $group_id',
+                    f'{current}.logical_type = {json.dumps(snapshot["type_name"])}',
+                    f'{current}.source_uuid = {json.dumps(snapshot["source_id"])}',
+                    f'{current}.target_uuid = {json.dumps(snapshot["target_id"])}',
+                    f'{current}.source = {node_expr(snapshot["source_id"])}',
+                    f'{current}.target = {node_expr(snapshot["target_id"])}',
+                    f'({current}.edge.valid_at = $snapshot_valid_{snapshot_index} OR '
+                    f'({current}.edge.valid_at IS NULL AND $snapshot_valid_{snapshot_index} IS NULL))',
+                    f'({current}.edge.invalid_at = $snapshot_invalid_{snapshot_index} OR '
+                    f'({current}.edge.invalid_at IS NULL AND $snapshot_invalid_{snapshot_index} IS NULL))',
+                    f'({current}.edge.expired_at = $snapshot_expired_{snapshot_index} OR '
+                    f'({current}.edge.expired_at IS NULL AND $snapshot_expired_{snapshot_index} IS NULL))',
+                    f'all(key IN keys($snapshot_props_{snapshot_index}) WHERE '
+                    f'({current}.edge[key] = $snapshot_props_{snapshot_index}[key] OR '
+                    f'({current}.edge[key] IS NULL AND $snapshot_props_{snapshot_index}[key] IS NULL)))',
+                    f'all(key IN keys({current}.edge) WHERE key IN $snapshot_keys_{snapshot_index} '
+                    f'OR {current}.edge[key] IS NULL '
+                    f'OR key IN $snapshot_reserved_edge_keys)',
+                ])
+                if expected_revision is not None:
+                    gates.append(f'typeOf({current}.edge._revision) = "Integer"')
+                    gates.append(f'{current}.edge._revision = {int(expected_revision)}')
+                if snapshot.get('created_at') is not None:
+                    gates.append(f'{current}.edge.created_at = $snapshot_created_{snapshot_index}')
+
+        for selection_index, selection in enumerate(state.get('unique_active_edges') or []):
+            params[f'sel_{selection_index}'] = selection
+            sel = f'$sel_{selection_index}'
+            match = (
+                f'[item IN active_edges WHERE item.logical_type = {sel}.type_name '
+                f'AND item.source_uuid = {sel}.source_id AND item.target_uuid = {sel}.target_id '
+                f'AND item.source = {node_expr(selection["source_id"])} '
+                f'AND item.target = {node_expr(selection["target_id"])}]'
+            )
+            gates.append(f'size({match}) = 1' if selection.get('expected_uuid') else f'size({match}) = 0')
+            if selection.get('expected_uuid'):
+                gates.append(f'head({match}).uuid = {sel}.expected_uuid')
+        for uuid in state.get('isolated_entity_ids') or []:
+            gates.append(
+                f'size([incident IN incident_edges WHERE incident.source_uuid = {json.dumps(uuid)} '
+                f'OR incident.target_uuid = {json.dumps(uuid)}]) = 0'
+            )
+        for endpoint_id in endpoint_ids:
+            gates.append(
+                f'((size([n IN node_candidates WHERE n.uuid = {json.dumps(endpoint_id)}]) = 1 '
+                f'AND size([n IN node_candidates WHERE n.uuid = {json.dumps(endpoint_id)} '
+                f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)]) = 1 '
+                f') OR {json.dumps(endpoint_id)} IN $created_entity_ids)'
+            )
+        # Every absence assertion is checked against both node and edge UUIDs
+        # before the CREATE branches execute.
+        for absent_id in absent_ids:
+            gates.append(
+                f'size([n IN node_candidates WHERE n.uuid = {json.dumps(absent_id)}]) = 0'
+            )
+            gates.append(
+                f'size([item IN edge_candidates WHERE item.uuid = {json.dumps(absent_id)}]) = 0'
+            )
+        if not gates:
+            gates.append('false')
+        clauses.append(
+            'WITH *, CASE '
+            "WHEN size(prior_receipts) > 1 THEN 'HASH_CONFLICT' "
+            "WHEN size(prior_receipts) = 1 AND prior_receipts[0].request_hash <> $request_hash THEN 'HASH_CONFLICT' "
+            "WHEN size(prior_receipts) = 1 AND ("
+            "coalesce(prior_receipts[0].request_hash, '') <> $request_hash OR "
+            "coalesce(prior_receipts[0].person_id, '') <> $person_id OR "
+            "coalesce(prior_receipts[0].source_ref, '') <> $source_ref OR "
+            "coalesce(prior_receipts[0].status, '') <> 'APPLIED') THEN 'REJECTED' "
+            "WHEN size(prior_receipts) = 1 THEN 'REPLAYED' "
+            "WHEN " + ' AND '.join(gates) + " THEN 'READY' ELSE 'REJECTED' END AS gate_status"
+        )
+        # Create entities first so a relation in the same request may target a new entity.
+        for index, edit in enumerate(edits):
+            if edit['kind'] != 'entity' or edit['operation'] != 'create':
+                continue
+            label = cls._graph_write_identifier(edit['type_name'], 'entity type')
+            prop_key = property_keys[index]
+            clauses.append(
+                f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | '
+                f'CREATE (created_{index}:Entity:{label}) SET created_{index} = ${prop_key}, '
+                f'created_{index}.uuid = {json.dumps(edit["uuid"])}, created_{index}.group_id = $group_id, '
+                f'created_{index}.name = coalesce(created_{index}.name, {json.dumps(edit["type_name"])}), '
+                f'created_{index}.summary = coalesce(created_{index}.summary, ""), '
+                f'created_{index}.created_at = $now, '
+                f'created_{index}._revision = 1, created_{index}._action_execution_id = $request_id, '
+                f'created_{index}._updated_at = $now)'
+            )
+        clauses.extend([
+            'WITH gate_status, prior_receipts, node_candidates, edge_candidates, incident_edges, active_edges',
+            'OPTIONAL MATCH (post_node) WHERE post_node.uuid IN $entity_ids',
+            'WITH gate_status, prior_receipts, node_candidates, edge_candidates, incident_edges, active_edges, '
+            '[item IN collect(post_node) WHERE item IS NOT NULL] AS post_nodes',
+        ])
+
+        def post_node_expr(uuid: str) -> str:
+            return (
+                f'head([n IN post_nodes WHERE n.uuid = {json.dumps(uuid)} '
+                f'AND n.group_id = $group_id AND \'Entity\' IN labels(n)])'
+            )
+
+        # Bind existing nodes/edges after entity creation; all remaining writes remain gated.
+        aliases: list[str] = []
+        for index, edit in enumerate(edits):
+            if edit['kind'] == 'entity' and edit['operation'] != 'create':
+                alias = f'entity_{index}'
+                clauses.append(f'WITH *, {post_node_expr(edit["uuid"])} AS {alias}')
+                aliases.append(alias)
+            elif edit['kind'] == 'edge':
+                alias = f'edge_{index}'
+                clauses.append(
+                    f'WITH *, head([item IN edge_candidates WHERE item.uuid = {json.dumps(edit["uuid"])}]).edge AS {alias}'
+                )
+                aliases.append(alias)
+        # Persist the idempotency receipt inside the same graph query. A retry
+        # with the same request/hash reaches REPLAYED above; a different hash is
+        # rejected before this MERGE is reached.
+        clauses.append(
+            "FOREACH (_ IN CASE WHEN gate_status = 'READY' THEN [1] ELSE [] END | "
+            "MERGE (write_receipt:ActionGraphWriteReceipt {group_id: $group_id, request_id: $request_id}) "
+            "SET write_receipt.request_hash = $request_hash, write_receipt.status = 'APPLIED', "
+            "write_receipt.source_ref = $source_ref, write_receipt.person_id = $person_id, "
+            "write_receipt.created_at = $now)"
+        )
+        for index, edit in enumerate(edits):
+            if edit['kind'] == 'entity' and edit['operation'] != 'create':
+                alias = f'entity_{index}'
+                if edit['operation'] == 'update':
+                    prop_key = property_keys[index]
+                    clauses.append(f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | SET {alias} += ${prop_key}, {alias}._revision = coalesce({alias}._revision, 1) + 1, {alias}._action_execution_id = $request_id, {alias}._updated_at = $now)')
+                else:
+                    clauses.append(f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | DELETE {alias})')
+            elif edit['kind'] == 'edge':
+                alias = f'edge_{index}'
+                if edit['operation'] == 'update':
+                    prop_key = property_keys[index]
+                    clauses.append(f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | SET {alias} += ${prop_key}, {alias}._revision = coalesce({alias}._revision, 1) + 1, {alias}._action_execution_id = $request_id, {alias}._updated_at = $now)')
+                elif edit.get('delete_mode') == 'expire':
+                    clauses.append(f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | SET {alias}.invalid_at = $now, {alias}.expired_at = $now, {alias}._revision = coalesce({alias}._revision, 1) + 1, {alias}._action_execution_id = $request_id, {alias}._updated_at = $now)')
+                elif edit.get('delete_mode') == 'hard':
+                    raise ValueError('Hard edge delete is not supported by the atomic graph writer')
+
+        # Edge creation uses post-write endpoint nodes and the logical edge name.
+        for index, edit in enumerate(edits):
+            if edit['kind'] != 'edge' or edit['operation'] != 'create':
+                continue
+            prop_key = property_keys[index]
+            source = post_node_expr(edit['source_id'])
+            target = post_node_expr(edit['target_id'])
+            clauses.append(f'WITH *, {source} AS create_source_{index}, {target} AS create_target_{index}')
+            previous_uuid = edit.get('previous_edge_uuid')
+            new_revision = 1
+            lineage = ''
+            if previous_uuid is not None:
+                previous_snapshot = snapshots.get(previous_uuid) or {}
+                previous_revision = revisions.get(previous_uuid) or previous_snapshot.get('revision')
+                if type(previous_revision) is not int or previous_revision < 1:
+                    raise ValueError('Replacement revision is required')
+                new_revision = previous_revision + 1
+                lineage = f'created_edge_{index}._previous_edge_uuid = {json.dumps(previous_uuid)}, '
+            clauses.append(
+                f'FOREACH (_ IN CASE WHEN gate_status = \'READY\' THEN [1] ELSE [] END | '
+                f'CREATE (create_source_{index})-[created_edge_{index}:RELATES_TO]->(create_target_{index}) '
+                f'SET created_edge_{index} = ${prop_key}, created_edge_{index}.uuid = {json.dumps(edit["uuid"])}, '
+                f'created_edge_{index}.name = {json.dumps(edit["type_name"])}, created_edge_{index}.group_id = $group_id, '
+                f'created_edge_{index}.fact = coalesce(created_edge_{index}.fact, {json.dumps(edit["type_name"])}), '
+                f'created_edge_{index}.episodes = [], created_edge_{index}.created_at = $now, '
+                f'created_edge_{index}.valid_at = $now, created_edge_{index}._revision = {new_revision}, '
+                f'{lineage}'
+                f'created_edge_{index}._action_execution_id = $request_id, created_edge_{index}._updated_at = $now)'
+            )
+        clauses.append(
+            "RETURN $request_id AS request_id, $group_id AS group_id, $request_hash AS request_hash, "
+            "gate_status, CASE WHEN gate_status = 'READY' THEN 'APPLIED' "
+            "WHEN gate_status = 'REPLAYED' THEN 'REPLAYED' ELSE 'REJECTED' END AS status, "
+            f"CASE WHEN gate_status = 'READY' THEN {len(edits)} ELSE 0 END AS planned_changes, "
+            "CASE WHEN gate_status = 'HASH_CONFLICT' THEN 'GRAPH_WRITE_HASH_CONFLICT' "
+            "ELSE NULL END AS error_code"
+        )
+        return '\n'.join(clauses), params
+
+    async def execute_atomic_graph_write(
+        self,
+        *,
+        context: Any,
+        request: Any,
+        request_hash: str,
+        required_read_fields: Any,
+    ) -> dict[str, Any]:
+        """Execute a validated structured graph write in exactly one FalkorDB query."""
+        if getattr(self, '_atomic_graph_write_verified', False) is not True:
+            raise NotImplementedError('Atomic graph-write deployment gates are not verified')
+        if not isinstance(request_hash, str) or not request_hash.strip():
+            raise ValueError('Graph-write request hash is required')
+        query, params = self._graph_write_query(request, context)
+        params['request_hash'] = request_hash
+        result = await self.execute_query(query, **params)
+        records = result[0] if result else []
+        if len(records) != 1:
+            raise RuntimeError('Atomic graph-write returned an invalid receipt')
+        receipt = dict(records[0])
+        receipt.setdefault('request_id', request.request_id)
+        receipt.setdefault('group_id', context.group_id)
+        return receipt
 
     def session(self, database: str | None = None) -> GraphDriverSession:
         effective_db = database if database is not None else self._database

@@ -1,4 +1,3 @@
-from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -46,44 +45,25 @@ async def test_dedupe_nodes_bulk_reuses_canonical_nodes(monkeypatch):
 
     extracted_one = EntityNode(name='Alice Smith', group_id='group', labels=['Entity'])
     extracted_two = EntityNode(name='Alice Smith', group_id='group', labels=['Entity'])
-
-    canonical = extracted_one
-
-    call_queue = deque()
-
-    async def fake_resolve(
-        clients_arg,
-        nodes_arg,
-        episode_arg,
-        previous_episodes_arg,
-        entity_types_arg,
-        existing_nodes_override=None,
-    ):
-        call_queue.append(existing_nodes_override)
-
-        if nodes_arg == [extracted_one]:
-            return [canonical], {canonical.uuid: canonical.uuid}, []
-
-        assert nodes_arg == [extracted_two]
-        assert existing_nodes_override is None
-
-        return [canonical], {extracted_two.uuid: canonical.uuid}, [(extracted_two, canonical)]
-
-    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', fake_resolve)
+    extracted_three = EntityNode(name=' alice  smith ', group_id='group', labels=['Entity'])
+    resolve_mock = AsyncMock()
+    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', resolve_mock)
 
     nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
         clients,
-        [[extracted_one], [extracted_two]],
+        [[extracted_one], [extracted_two, extracted_three]],
         [(episode_one, []), (episode_two, [])],
     )
 
-    assert len(call_queue) == 2
-    assert call_queue[0] is None
-    assert call_queue[1] is None
-
-    assert nodes_by_episode[episode_one.uuid] == [canonical]
-    assert nodes_by_episode[episode_two.uuid] == [canonical]
-    assert compressed_map.get(extracted_two.uuid) == canonical.uuid
+    assert nodes_by_episode[episode_one.uuid][0] is extracted_one
+    assert nodes_by_episode[episode_two.uuid] == [extracted_one]
+    assert nodes_by_episode[episode_two.uuid][0] is extracted_one
+    assert compressed_map == {
+        extracted_one.uuid: extracted_one.uuid,
+        extracted_two.uuid: extracted_one.uuid,
+        extracted_three.uuid: extracted_one.uuid,
+    }
+    resolve_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -111,7 +91,7 @@ async def test_dedupe_nodes_bulk_single_episode(monkeypatch):
     episode = _make_episode('solo')
     extracted = EntityNode(name='Solo', group_id='group', labels=['Entity'])
 
-    resolve_mock = AsyncMock(return_value=([extracted], {extracted.uuid: extracted.uuid}, []))
+    resolve_mock = AsyncMock()
     monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', resolve_mock)
 
     nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
@@ -120,9 +100,9 @@ async def test_dedupe_nodes_bulk_single_episode(monkeypatch):
         [(episode, [])],
     )
 
-    assert nodes_by_episode == {episode.uuid: [extracted]}
-    assert compressed_map == {extracted.uuid: extracted.uuid}
-    resolve_mock.assert_awaited_once()
+    assert nodes_by_episode[episode.uuid][0] is extracted
+    assert compressed_map == {}
+    resolve_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -135,23 +115,8 @@ async def test_dedupe_nodes_bulk_uuid_map_respects_direction(monkeypatch):
     extracted_one = EntityNode(uuid='b-uuid', name='Edge Case', group_id='group', labels=['Entity'])
     extracted_two = EntityNode(uuid='a-uuid', name='Edge Case', group_id='group', labels=['Entity'])
 
-    canonical = extracted_one
-    alias = extracted_two
-
-    async def fake_resolve(
-        clients_arg,
-        nodes_arg,
-        episode_arg,
-        previous_episodes_arg,
-        entity_types_arg,
-        existing_nodes_override=None,
-    ):
-        if nodes_arg == [extracted_one]:
-            return [canonical], {canonical.uuid: canonical.uuid}, []
-        assert nodes_arg == [extracted_two]
-        return [canonical], {alias.uuid: canonical.uuid}, [(alias, canonical)]
-
-    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', fake_resolve)
+    resolve_mock = AsyncMock()
+    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', resolve_mock)
 
     nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
         clients,
@@ -159,31 +124,57 @@ async def test_dedupe_nodes_bulk_uuid_map_respects_direction(monkeypatch):
         [(episode_one, []), (episode_two, [])],
     )
 
-    assert nodes_by_episode[episode_one.uuid] == [canonical]
-    assert nodes_by_episode[episode_two.uuid] == [canonical]
-    assert compressed_map.get(alias.uuid) == canonical.uuid
+    assert nodes_by_episode[episode_one.uuid][0] is extracted_one
+    assert nodes_by_episode[episode_two.uuid][0] is extracted_one
+    assert compressed_map == {
+        extracted_one.uuid: extracted_one.uuid,
+        extracted_two.uuid: extracted_one.uuid,
+    }
+    resolve_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_dedupe_nodes_bulk_missing_canonical_falls_back(monkeypatch, caplog):
+async def test_dedupe_nodes_bulk_retains_unmatched_nodes_without_aliases(monkeypatch):
     clients = _make_clients()
 
-    episode = _make_episode('missing')
-    extracted = EntityNode(name='Fallback', group_id='group', labels=['Entity'])
+    episode = _make_episode('unmatched')
+    first = EntityNode(name='Fallback', group_id='group', labels=['Entity'])
+    second = EntityNode(name='Unrelated Service', group_id='group', labels=['Entity'])
 
-    resolve_mock = AsyncMock(return_value=([extracted], {extracted.uuid: 'missing-canonical'}, []))
+    resolve_mock = AsyncMock()
     monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', resolve_mock)
 
-    with caplog.at_level('WARNING'):
-        nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
-            clients,
-            [[extracted]],
-            [(episode, [])],
-        )
+    nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
+        clients,
+        [[first, second]],
+        [(episode, [])],
+    )
 
-    assert nodes_by_episode[episode.uuid] == [extracted]
-    assert compressed_map.get(extracted.uuid) == 'missing-canonical'
-    assert any('Canonical node missing' in rec.message for rec in caplog.records)
+    assert nodes_by_episode[episode.uuid][0] is first
+    assert nodes_by_episode[episode.uuid][1] is second
+    assert compressed_map == {}
+    resolve_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dedupe_nodes_bulk_minhash_reuses_normalized_fuzzy_match(monkeypatch):
+    clients = _make_clients()
+    episode = _make_episode('minhash')
+    canonical = EntityNode(name='Alice-Smith', group_id='group', labels=['Entity'])
+    alias = EntityNode(name='Alice Smith', group_id='group', labels=['Entity'])
+    resolve_mock = AsyncMock()
+    monkeypatch.setattr(bulk_utils, 'resolve_extracted_nodes', resolve_mock)
+
+    nodes_by_episode, compressed_map = await bulk_utils.dedupe_nodes_bulk(
+        clients,
+        [[canonical, alias]],
+        [(episode, [])],
+    )
+
+    assert nodes_by_episode[episode.uuid] == [canonical]
+    assert nodes_by_episode[episode.uuid][0] is canonical
+    assert compressed_map == {canonical.uuid: canonical.uuid, alias.uuid: canonical.uuid}
+    resolve_mock.assert_not_awaited()
 
 
 def test_build_directed_uuid_map_empty():
