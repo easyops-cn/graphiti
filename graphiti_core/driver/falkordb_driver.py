@@ -414,7 +414,9 @@ class FalkorDriver(GraphDriver):
             "logical_type: coalesce(edge_candidate.name, type(edge_candidate))} END) "
             'WHERE item IS NOT NULL] AS edge_candidates',
             'OPTIONAL MATCH (incident_source)-[incident_edge]-(incident_target) '
-            'WHERE incident_source.uuid IN $entity_ids OR incident_target.uuid IN $entity_ids',
+            'WHERE (incident_source.uuid IN $entity_ids OR incident_target.uuid IN $entity_ids) '
+            'AND incident_edge.invalid_at IS NULL AND incident_edge.expired_at IS NULL '
+            "AND 'Entity' IN labels(incident_source) AND 'Entity' IN labels(incident_target)",
             "WITH prior_receipts, node_candidates, edge_candidates, [item IN collect(CASE WHEN incident_edge IS NULL THEN NULL "
             "ELSE {source_uuid: incident_source.uuid, target_uuid: incident_target.uuid} END) "
             'WHERE item IS NOT NULL] AS incident_edges',
